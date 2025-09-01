@@ -52,6 +52,18 @@ class JobItem:
     # 元数据（尺寸）
     orig_size: Tuple[int, int] = (0, 0)
 
+    # 高级参数（按格式生效）
+    # JPEG
+    jpeg_progressive: bool = False
+    jpeg_optimize: bool = True
+    # PNG
+    png_optimize: bool = False
+    # WEBP
+    webp_lossless: bool = False
+    webp_method: int = 4  # 0-6
+    # TIFF
+    tiff_compression: str = "tiff_deflate"  # tiff_deflate/tiff_lzw/tiff_adobe_deflate
+
     @staticmethod
     def from_source(path: str) -> "JobItem":
         # 初始导出目录设为当前工作目录下的 output
@@ -82,6 +94,13 @@ class AppSettings:
     default_format: str = "jpg"
     default_quality: int = 90
     default_png_compress_level: int = 6
+    # 高级默认参数
+    default_jpeg_progressive: bool = False
+    default_jpeg_optimize: bool = True
+    default_png_optimize: bool = False
+    default_webp_lossless: bool = False
+    default_webp_method: int = 4
+    default_tiff_compression: str = "tiff_deflate"
     default_dpi: Tuple[int, int] = (300, 300)
     default_size: Tuple[int, int] = (0, 0)
     default_keep_aspect: bool = True

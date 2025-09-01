@@ -132,6 +132,90 @@ class AppSettingsDialog(QDialog):
         return enable, action, dup
 
 
+class FormatSettingsDialog(QDialog):
+    """格式相关的高级设置对话框。"""
+
+    def __init__(self, fmt: str, parent: QWidget | None, mw: 'MainWindow') -> None:
+        super().__init__(parent)
+        self.setWindowTitle("更多设置")
+        self.resize(420, 320)
+        self._fmt = (fmt or '').lower()
+        self._mw = mw
+        lay = QVBoxLayout(self)
+
+        form = QFormLayout()
+        # 通用：DPI
+        self.sp_dpi_x = QSpinBox(); self.sp_dpi_x.setRange(50, 1200); self.sp_dpi_x.setValue(mw._adv_dpi_x)
+        self.sp_dpi_y = QSpinBox(); self.sp_dpi_y.setRange(50, 1200); self.sp_dpi_y.setValue(mw._adv_dpi_y)
+        form.addRow("DPI-X", self.sp_dpi_x)
+        form.addRow("DPI-Y", self.sp_dpi_y)
+
+        if self._fmt in ('jpg','jpeg'):
+            self.chk_jpg_prog = QCheckBox("渐进式(Progressive)")
+            self.chk_jpg_prog.setChecked(mw._adv_jpeg_progressive)
+            self.chk_jpg_opt = QCheckBox("优化(Optimize)")
+            self.chk_jpg_opt.setChecked(mw._adv_jpeg_optimize)
+            form.addRow(self.chk_jpg_prog)
+            form.addRow(self.chk_jpg_opt)
+        elif self._fmt == 'png':
+            self.chk_png_opt = QCheckBox("优化(Optimize)")
+            self.chk_png_opt.setChecked(mw._adv_png_optimize)
+            form.addRow(self.chk_png_opt)
+        elif self._fmt == 'webp':
+            self.chk_webp_lossless = QCheckBox("无损(Lossless)")
+            self.chk_webp_lossless.setChecked(mw._adv_webp_lossless)
+            self.sl_webp_method = QSlider(Qt.Horizontal); self.sl_webp_method.setRange(0, 6); self.sl_webp_method.setValue(int(mw._adv_webp_method))
+            self.lbl_webp_method = QLabel(str(mw._adv_webp_method))
+            self.sl_webp_method.valueChanged.connect(lambda v: self.lbl_webp_method.setText(str(v)))
+            row = QWidget(); rlay = QHBoxLayout(row); rlay.setContentsMargins(0,0,0,0)
+            rlay.addWidget(self.sl_webp_method, 1); rlay.addWidget(self.lbl_webp_method)
+            form.addRow(self.chk_webp_lossless)
+            form.addRow("方法(method)", row)
+        elif self._fmt in ('tif','tiff'):
+            self.cmb_tiff_comp = QComboBox(); self.cmb_tiff_comp.addItems(["tiff_deflate","tiff_lzw","tiff_adobe_deflate"])
+            try:
+                idx = ["tiff_deflate","tiff_lzw","tiff_adobe_deflate"].index(mw._adv_tiff_compression)
+            except ValueError:
+                idx = 0
+            self.cmb_tiff_comp.setCurrentIndex(idx)
+            form.addRow("压缩方式", self.cmb_tiff_comp)
+
+        lay.addLayout(form)
+
+        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        lay.addStretch(1)
+        lay.addWidget(btns)
+
+    def apply_to_main(self) -> None:
+        """将对话框选择应用回主窗口缓存与设置。"""
+        mw = self._mw
+        # DPI
+        mw._adv_dpi_x = self.sp_dpi_x.value()
+        mw._adv_dpi_y = self.sp_dpi_y.value()
+        # 格式相关
+        if self._fmt in ('jpg','jpeg'):
+            mw._adv_jpeg_progressive = bool(self.chk_jpg_prog.isChecked())
+            mw._adv_jpeg_optimize = bool(self.chk_jpg_opt.isChecked())
+            mw.settings.default_jpeg_progressive = mw._adv_jpeg_progressive
+            mw.settings.default_jpeg_optimize = mw._adv_jpeg_optimize
+        elif self._fmt == 'png':
+            mw._adv_png_optimize = bool(self.chk_png_opt.isChecked())
+            mw.settings.default_png_optimize = mw._adv_png_optimize
+        elif self._fmt == 'webp':
+            mw._adv_webp_lossless = bool(self.chk_webp_lossless.isChecked())
+            mw._adv_webp_method = int(self.sl_webp_method.value())
+            mw.settings.default_webp_lossless = mw._adv_webp_lossless
+            mw.settings.default_webp_method = mw._adv_webp_method
+        elif self._fmt in ('tif','tiff'):
+            mw._adv_tiff_compression = self.cmb_tiff_comp.currentText()
+            mw.settings.default_tiff_compression = mw._adv_tiff_compression
+        # 通用默认写回
+        mw.settings.default_dpi = (mw._adv_dpi_x, mw._adv_dpi_y)
+        AppSettings.save(mw.settings)
+
+
 class SignalBus(QObject):
     """跨线程信号总线：确保UI更新在主线程执行。"""
     job_update = Signal(int, object)  # (index, JobItem)
@@ -210,6 +294,15 @@ class MainWindow(QMainWindow):
         self._really_quit = False
         self._notified_all_done = False
 
+        # 高级设置缓存（从AppSettings装载）
+        self._adv_jpeg_progressive = bool(getattr(self.settings, 'default_jpeg_progressive', False))
+        self._adv_jpeg_optimize = bool(getattr(self.settings, 'default_jpeg_optimize', True))
+        self._adv_png_optimize = bool(getattr(self.settings, 'default_png_optimize', False))
+        self._adv_webp_lossless = bool(getattr(self.settings, 'default_webp_lossless', False))
+        self._adv_webp_method = int(getattr(self.settings, 'default_webp_method', 4))
+        self._adv_tiff_compression = str(getattr(self.settings, 'default_tiff_compression', 'tiff_deflate'))
+        self._adv_dpi_x, self._adv_dpi_y = self.settings.default_dpi
+
         # 系统托盘
         self._init_tray()
 
@@ -286,6 +379,8 @@ class MainWindow(QMainWindow):
 
     def _on_click_start_pause_resume(self) -> None:
         if self._start_button_state == "start":
+            # 在开始前，将当前检查器参数应用到所有未完成任务，避免仅更改下拉未点击“应用到选中”导致始终导出JPG
+            self._apply_current_settings_to_pending_jobs()
             # 提交任务前进行重名检测与处理
             if not self._preflight_conflicts():
                 return
@@ -318,6 +413,14 @@ class MainWindow(QMainWindow):
         AppSettings.save(self.settings)
         self._load_settings_into_inspector()
         self._refresh_inspector_preview()
+        # 同步高级设置缓存
+        self._adv_jpeg_progressive = self.settings.default_jpeg_progressive
+        self._adv_jpeg_optimize = self.settings.default_jpeg_optimize
+        self._adv_png_optimize = self.settings.default_png_optimize
+        self._adv_webp_lossless = self.settings.default_webp_lossless
+        self._adv_webp_method = self.settings.default_webp_method
+        self._adv_tiff_compression = self.settings.default_tiff_compression
+        self._adv_dpi_x, self._adv_dpi_y = self.settings.default_dpi
 
     def _action_open_prefs(self) -> None:
         # 轻量化：直接基于当前 inspector 的设置保存为默认
@@ -461,6 +564,23 @@ class MainWindow(QMainWindow):
                 continue
             item = JobItem.from_source(p)
             item.export_dir = self.output_dir
+            # 新增：按当前检查器设置初始化新任务的导出格式与关键参数
+            fmt = self.ins_format.currentText().lower()
+            item.export_format = fmt
+            if fmt in ("jpg", "jpeg"):
+                item.quality = self.jpeg_quality.value()
+                item.jpeg_progressive = self._adv_jpeg_progressive
+                item.jpeg_optimize = self._adv_jpeg_optimize
+            elif fmt == "png":
+                item.png_compress_level = self.png_level.value()
+                item.png_optimize = self._adv_png_optimize
+            else:
+                item.quality = self.other_quality.value()
+                if fmt == 'webp':
+                    item.webp_lossless = self._adv_webp_lossless
+                    item.webp_method = self._adv_webp_method
+                elif fmt in ('tif','tiff'):
+                    item.tiff_compression = self._adv_tiff_compression
             self.jobs.append(item)
             row = self._create_row(item, len(self.jobs)-1)
             self.queue.addTopLevelItem(row)
@@ -502,7 +622,7 @@ class MainWindow(QMainWindow):
             self.ins_format.addItem(fmt)
         form1.addRow("格式", self.ins_format)
 
-        # 参数区使用堆叠面板以保持组框尺寸稳定
+        # 参数区使用堆叠面板以保持组框尺寸稳定，仅放每种格式1-2个最重要参数
         self.ins_param_stack = QStackedWidget()
         self.ins_param_stack.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
@@ -542,10 +662,11 @@ class MainWindow(QMainWindow):
         self.ins_param_stack.setFixedHeight(h)
         form1.addRow("参数", self.ins_param_stack)
 
-        self.ins_dpi_x = QSpinBox(); self.ins_dpi_x.setRange(50, 600); self.ins_dpi_x.setValue(300)
-        self.ins_dpi_y = QSpinBox(); self.ins_dpi_y.setRange(50, 600); self.ins_dpi_y.setValue(300)
-        form1.addRow("DPI-X", self.ins_dpi_x)
-        form1.addRow("DPI-Y", self.ins_dpi_y)
+        # 更多设置按钮（弹出格式相关的高级设置）
+        btn_more = QPushButton("更多设置…")
+        btn_more.clicked.connect(self._open_format_settings_dialog)
+        form1.addRow("", btn_more)
+
 
         # 尺寸
         grp_size = QGroupBox("尺寸")
@@ -600,8 +721,6 @@ class MainWindow(QMainWindow):
         self.jpeg_quality.setValue(min(95, max(1, self.settings.default_quality)))
         self.png_level.setValue(max(0, min(9, getattr(self.settings, 'default_png_compress_level', 6))))
         self.other_quality.setValue(min(100, max(1, self.settings.default_quality)))
-        self.ins_dpi_x.setValue(self.settings.default_dpi[0])
-        self.ins_dpi_y.setValue(self.settings.default_dpi[1])
         self.ins_width.setValue(self.settings.default_size[0])
         self.ins_height.setValue(self.settings.default_size[1])
         self.ins_keep_aspect.setChecked(self.settings.default_keep_aspect)
@@ -648,13 +767,21 @@ class MainWindow(QMainWindow):
             job.export_format = fmt
             if fmt in ("jpg", "jpeg"):
                 job.quality = self.jpeg_quality.value()
+                job.jpeg_progressive = self._adv_jpeg_progressive
+                job.jpeg_optimize = self._adv_jpeg_optimize
             elif fmt == "png":
                 job.png_compress_level = self.png_level.value()
                 # 保留质量用于其他用途，但不影响PNG保存
                 job.quality = self.other_quality.value()
+                job.png_optimize = self._adv_png_optimize
             else:
                 job.quality = self.other_quality.value()
-            job.dpi = (self.ins_dpi_x.value(), self.ins_dpi_y.value())
+                if fmt == 'webp':
+                    job.webp_lossless = self._adv_webp_lossless
+                    job.webp_method = self._adv_webp_method
+                elif fmt in ('tif','tiff'):
+                    job.tiff_compression = self._adv_tiff_compression
+            job.dpi = (self._adv_dpi_x, self._adv_dpi_y)
             job.req_size = (self.ins_width.value(), self.ins_height.value())
             job.keep_aspect = self.ins_keep_aspect.isChecked()
             job.template = self.ins_template.text()
@@ -811,6 +938,30 @@ class MainWindow(QMainWindow):
                 # 更新UI行
                 self._on_job_update(idx, job)
 
+    def _apply_current_settings_to_pending_jobs(self) -> None:
+        """将当前检查器设置应用到所有未完成任务，避免用户未点击“应用到选中”。"""
+        fmt = self.ins_format.currentText().lower()
+        for job in self.jobs:
+            if job.status not in (JobStatus.WAITING, JobStatus.PAUSED):
+                continue
+            job.export_format = fmt
+            if fmt in ("jpg", "jpeg"):
+                job.quality = self.jpeg_quality.value()
+                job.jpeg_progressive = self._adv_jpeg_progressive
+                job.jpeg_optimize = self._adv_jpeg_optimize
+            elif fmt == "png":
+                job.png_compress_level = self.png_level.value()
+                job.png_optimize = self._adv_png_optimize
+                # 质量保留为其他用途
+                job.quality = self.other_quality.value()
+            else:
+                job.quality = self.other_quality.value()
+                if fmt == 'webp':
+                    job.webp_lossless = self._adv_webp_lossless
+                    job.webp_method = self._adv_webp_method
+                elif fmt in ('tif','tiff'):
+                    job.tiff_compression = self._adv_tiff_compression
+
     # ---------- 托盘与后台 ----------
     def _init_tray(self) -> None:
         if not QSystemTrayIcon.isSystemTrayAvailable():
@@ -923,6 +1074,13 @@ class MainWindow(QMainWindow):
             self.settings.on_close_action = action
             self.settings.collision_policy = dup
             AppSettings.save(self.settings)
+
+    def _open_format_settings_dialog(self) -> None:
+        """打开‘更多设置’对话框，依当前格式显示高级参数。"""
+        fmt = self.ins_format.currentText().lower()
+        dlg = FormatSettingsDialog(fmt, self, self)
+        if dlg.exec() == QDialog.Accepted:
+            dlg.apply_to_main()
 
     def _ensure_valid_output_dir(self) -> None:
         """保留占位以兼容旧调用（已不在启动时强制创建）。"""

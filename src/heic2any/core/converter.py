@@ -52,6 +52,13 @@ def convert_one(
     req_size: Tuple[int, int],
     keep_aspect: bool,
     png_compress_level: Optional[int] = None,
+    # 高级参数（可选）
+    jpeg_progressive: bool | None = None,
+    jpeg_optimize: bool | None = None,
+    png_optimize: bool | None = None,
+    webp_lossless: bool | None = None,
+    webp_method: Optional[int] = None,
+    tiff_compression: Optional[str] = None,
 ) -> Tuple[int, int]:
     """执行单张图片转换。
 
@@ -101,18 +108,30 @@ def convert_one(
         save_kwargs = {"dpi": dpi}
         f = fmt.lower()
         if f in ("jpg", "jpeg"):
-            save_kwargs.update({"quality": max(1, min(100, quality)), "optimize": True})
+            q = max(1, min(100, quality))
+            opt = True if jpeg_optimize is None else bool(jpeg_optimize)
+            save_kwargs.update({"quality": q, "optimize": opt})
+            if jpeg_progressive:
+                save_kwargs.update({"progressive": True})
         elif f == "png":
             if png_compress_level is None:
                 level = _map_png_quality_to_compress_level(quality)
             else:
                 level = max(0, min(9, int(png_compress_level)))
             save_kwargs.update({"compress_level": level})
+            if png_optimize:
+                save_kwargs.update({"optimize": True})
         elif f in ("tif", "tiff"):
-            save_kwargs.update({"compression": "tiff_deflate"})
+            comp = tiff_compression if tiff_compression else "tiff_deflate"
+            save_kwargs.update({"compression": comp})
         elif f == "webp":
             # WebP质量：1-100，数值越大画质越好
             save_kwargs.update({"quality": max(1, min(100, quality))})
+            if webp_lossless:
+                save_kwargs.update({"lossless": True})
+            if webp_method is not None:
+                m = max(0, min(6, int(webp_method)))
+                save_kwargs.update({"method": m})
 
         # 让Pillow按扩展名自动识别格式，可避免'JPG'等大小写映射问题
         im.save(dst_path, **save_kwargs)

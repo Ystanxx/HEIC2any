@@ -109,6 +109,12 @@ class TaskManager:
                 req_size=job.req_size,
                 keep_aspect=job.keep_aspect,
                 png_compress_level=job.png_compress_level if job.export_format.lower() == 'png' else None,
+                jpeg_progressive=job.jpeg_progressive if job.export_format.lower() in ('jpg','jpeg') else None,
+                jpeg_optimize=job.jpeg_optimize if job.export_format.lower() in ('jpg','jpeg') else None,
+                png_optimize=job.png_optimize if job.export_format.lower() == 'png' else None,
+                webp_lossless=job.webp_lossless if job.export_format.lower() == 'webp' else None,
+                webp_method=job.webp_method if job.export_format.lower() == 'webp' else None,
+                tiff_compression=job.tiff_compression if job.export_format.lower() in ('tif','tiff') else None,
             )
             job.orig_size = (w, h)
             job.progress = 100
