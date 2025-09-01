@@ -1,0 +1,15 @@
+/* 简洁QSS，保证清晰易读 */
+QMainWindow {
+    background: #fafafa;
+}
+QTreeWidget::item:selected {
+    background: #e6f2ff;
+}
+QGroupBox {
+    font-weight: 600;
+    margin-top: 8px;
+}
+QGroupBox::title {
+    subcontrol-origin: margin;
+    left: 8px;
+}
