@@ -51,7 +51,7 @@ class TaskManager:
         for idx, job in enumerate(jobs):
             if self._stop.is_set():
                 break
-            if job.status in (JobStatus.COMPLETED, JobStatus.RUNNING):
+            if job.status in (JobStatus.COMPLETED, JobStatus.RUNNING, JobStatus.CANCELLED):
                 continue
             f = self._executor.submit(self._run_one, idx, job)
             with self._lock:

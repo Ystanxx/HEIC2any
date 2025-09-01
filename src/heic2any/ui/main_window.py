@@ -21,13 +21,13 @@ from PySide6.QtWidgets import (
     QSplitter, QTreeWidget, QTreeWidgetItem, QFileDialog, QMenu, QToolButton,
     QStatusBar, QProgressBar, QComboBox, QGroupBox, QFormLayout, QSlider,
     QSpinBox, QCheckBox, QLineEdit, QStyle, QMessageBox, QDialog, QListWidget,
-    QListWidgetItem, QDialogButtonBox, QSystemTrayIcon, QRadioButton, QButtonGroup
+    QListWidgetItem, QDialogButtonBox, QSystemTrayIcon, QRadioButton
 )
 
 from heic2any.core.state import JobItem, JobStatus, ExportFormat, AppSettings
 from heic2any.core.tasks import TaskManager
 from heic2any.utils.images import make_placeholder_thumbnail, load_thumbnail
-from heic2any.utils.naming import render_output_name
+from heic2any.utils.naming import render_output_name, build_output_path
 from heic2any.utils.conda import CondaEnv, find_conda_envs, test_env_dependencies
 
 
@@ -91,6 +91,23 @@ class AppSettingsDialog(QDialog):
         fl2.addRow(self.radio_exit)
         fl2.addRow(self.radio_min)
 
+        # 重名处理
+        grp_dup = QGroupBox("重名文件处理")
+        fl3 = QFormLayout(grp_dup)
+        self.radio_dup_replace = QRadioButton("替换已存在的同名文件")
+        self.radio_dup_skip = QRadioButton("跳过已存在的同名文件")
+        self.radio_dup_ask = QRadioButton("让我决定每个文件")
+        pol = getattr(settings, 'collision_policy', 'ask')
+        if pol == 'replace':
+            self.radio_dup_replace.setChecked(True)
+        elif pol == 'skip':
+            self.radio_dup_skip.setChecked(True)
+        else:
+            self.radio_dup_ask.setChecked(True)
+        fl3.addRow(self.radio_dup_replace)
+        fl3.addRow(self.radio_dup_skip)
+        fl3.addRow(self.radio_dup_ask)
+
         # 按钮
         btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         btns.accepted.connect(self.accept)
@@ -98,14 +115,21 @@ class AppSettingsDialog(QDialog):
 
         lay.addWidget(grp_notify)
         lay.addWidget(grp_close)
+        lay.addWidget(grp_dup)
         lay.addStretch(1)
         lay.addWidget(btns)
 
-    def values(self) -> tuple[bool, str]:
-        """返回(启用通知, 关闭行为)。"""
+    def values(self) -> tuple[bool, str, str]:
+        """返回(启用通知, 关闭行为, 重名策略)。"""
         enable = self.chk_notify.isChecked()
         action = 'minimize' if self.radio_min.isChecked() else 'exit'
-        return enable, action
+        if self.radio_dup_replace.isChecked():
+            dup = 'replace'
+        elif self.radio_dup_skip.isChecked():
+            dup = 'skip'
+        else:
+            dup = 'ask'
+        return enable, action, dup
 
 
 class SignalBus(QObject):
@@ -262,7 +286,9 @@ class MainWindow(QMainWindow):
 
     def _on_click_start_pause_resume(self) -> None:
         if self._start_button_state == "start":
-            # 提交任务
+            # 提交任务前进行重名检测与处理
+            if not self._preflight_conflicts():
+                return
             self.task_manager.set_threads(self.ins_threads.value())
             self.task_manager.start(self.jobs)
             self._start_button_state = "pause"
@@ -630,6 +656,89 @@ class MainWindow(QMainWindow):
             canc = sum(1 for j in self.jobs if j.status == JobStatus.CANCELLED)
             self._show_notification("处理完成", f"共{total}项：成功{succ}，失败{fail}，取消{canc}")
             self._notified_all_done = True
+            # 重置开始按钮并释放执行器，允许重新开始
+            try:
+                self.task_manager.stop()
+            except Exception:
+                pass
+            self._start_button_state = "start"
+            self._refresh_topbar_states()
+
+    # ---------- 重名预检 ----------
+    def _preflight_conflicts(self) -> bool:
+        """启动前检查输出目录同名文件，并按设置处理。
+
+        返回：是否继续开始任务。
+        """
+        # 收集冲突列表（仅检测磁盘已存在的文件）
+        conflicts: list[tuple[int, str]] = []  # (job_index, out_path)
+        for idx, job in enumerate(self.jobs):
+            if job.status in (JobStatus.COMPLETED, JobStatus.RUNNING, JobStatus.CANCELLED):
+                continue
+            out_path = build_output_path(job, idx + 1)
+            try:
+                if os.path.exists(out_path):
+                    conflicts.append((idx, out_path))
+            except Exception:
+                pass
+
+        if not conflicts:
+            return True
+
+        policy = getattr(self.settings, 'collision_policy', 'ask')
+        if policy == 'replace':
+            return True
+        if policy == 'skip':
+            self._apply_skip_for_conflicts(conflicts, reason="同名文件已存在，按设置跳过")
+            return True
+
+        # 询问用户如何处理：替换/跳过/逐个决定
+        msg = QMessageBox(self)
+        msg.setWindowTitle("重名文件处理")
+        msg.setText(f"检测到{len(conflicts)}个输出文件已存在，选择处理方式：")
+        btn_replace = msg.addButton("替换全部", QMessageBox.AcceptRole)
+        btn_skip = msg.addButton("跳过全部", QMessageBox.ActionRole)
+        btn_each = msg.addButton("逐个决定", QMessageBox.ActionRole)
+        btn_cancel = msg.addButton("取消开始", QMessageBox.RejectRole)
+        msg.setIcon(QMessageBox.Warning)
+        msg.exec()
+        clicked = msg.clickedButton()
+        if clicked == btn_cancel:
+            return False
+        elif clicked == btn_replace:
+            return True
+        elif clicked == btn_skip:
+            self._apply_skip_for_conflicts(conflicts, reason="同名文件已存在，已跳过")
+            return True
+        else:
+            # 逐个确认
+            for idx, path in conflicts:
+                base = os.path.basename(path)
+                q = QMessageBox(self)
+                q.setWindowTitle("重名文件")
+                q.setText(f"输出文件已存在：\n{base}\n是否替换？")
+                b1 = q.addButton("替换", QMessageBox.AcceptRole)
+                b2 = q.addButton("跳过", QMessageBox.DestructiveRole)
+                b3 = q.addButton("停止开始", QMessageBox.RejectRole)
+                q.setIcon(QMessageBox.Question)
+                q.exec()
+                c = q.clickedButton()
+                if c == b3:
+                    return False
+                elif c == b2:
+                    self._apply_skip_for_conflicts([(idx, path)], reason="同名文件已存在，已跳过")
+            return True
+
+    def _apply_skip_for_conflicts(self, conflicts: list[tuple[int, str]], reason: str) -> None:
+        """将冲突条目标记为取消并更新队列显示。"""
+        for idx, _ in conflicts:
+            if 0 <= idx < len(self.jobs):
+                job = self.jobs[idx]
+                job.status = JobStatus.CANCELLED
+                job.progress = 100
+                job.error = reason
+                # 更新UI行
+                self._on_job_update(idx, job)
 
     # ---------- 托盘与后台 ----------
     def _init_tray(self) -> None:
@@ -738,9 +847,10 @@ class MainWindow(QMainWindow):
         """打开应用设置对话框。"""
         dlg = AppSettingsDialog(self.settings, self)
         if dlg.exec() == QDialog.Accepted:
-            enable, action = dlg.values()
+            enable, action, dup = dlg.values()
             self.settings.enable_notifications = enable
             self.settings.on_close_action = action
+            self.settings.collision_policy = dup
             AppSettings.save(self.settings)
 
     def _ensure_valid_output_dir(self) -> None:

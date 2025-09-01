@@ -92,6 +92,8 @@ class AppSettings:
     on_close_action: str = "ask"       # 关闭行为："ask"/"exit"/"minimize"
     # 新增：记住上次输入目录
     last_input_dir: str = ""
+    # 新增：重名文件处理策略："ask"/"replace"/"skip"
+    collision_policy: str = "ask"
 
     @staticmethod
     def load() -> "AppSettings":
