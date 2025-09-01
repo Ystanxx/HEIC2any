@@ -11,7 +11,7 @@ from typing import Optional
 
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QIcon, QPalette, QColor
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QStyle
 
 from heic2any.ui.main_window import MainWindow
 
@@ -56,16 +56,28 @@ def run_app() -> int:
     _tune_palette(app)
     _load_qss(app)
 
-    win = MainWindow()
-    # 尝试设置图标，若无则忽略
+    # 应用图标：优先仓库根目录下的 logo.jpg，其次 resources/app.png；都不存在则使用系统标准图标
     try:
-        base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        icon_path = os.path.join(base_dir, 'heic2any', 'resources', 'app.png')
-        if os.path.exists(icon_path):
-            app.setWindowIcon(QIcon(icon_path))
+        src_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # 指向 src 目录
+        repo_root = os.path.dirname(src_dir)
+        logo_root = os.path.join(repo_root, 'logo.jpg')
+        icon_path_res = os.path.join(src_dir, 'heic2any', 'resources', 'app.png')
+        if os.path.exists(logo_root):
+            icon_obj = QIcon(logo_root)
+        elif os.path.exists(icon_path_res):
+            icon_obj = QIcon(icon_path_res)
+        else:
+            icon_obj = app.style().standardIcon(QStyle.SP_ComputerIcon)
+        app.setWindowIcon(icon_obj)
+    except Exception:
+        pass
+
+    win = MainWindow()
+    try:
+        # 同步窗口图标，确保托盘使用到有效图标
+        win.setWindowIcon(app.windowIcon())
     except Exception:
         pass
 
     win.show()
     return app.exec()
-

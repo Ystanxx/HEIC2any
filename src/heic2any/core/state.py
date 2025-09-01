@@ -87,6 +87,11 @@ class AppSettings:
     default_template: str = "{name}_{index}"
     default_output_dir: str = field(default_factory=lambda: os.path.join(os.getcwd(), 'output'))
     selected_env_prefix: str = ""
+    # 新增：应用设置（通知与关闭行为）
+    enable_notifications: bool = True  # 是否启用托盘通知
+    on_close_action: str = "ask"       # 关闭行为："ask"/"exit"/"minimize"
+    # 新增：记住上次输入目录
+    last_input_dir: str = ""
 
     @staticmethod
     def load() -> "AppSettings":

@@ -21,7 +21,7 @@ from PySide6.QtWidgets import (
     QSplitter, QTreeWidget, QTreeWidgetItem, QFileDialog, QMenu, QToolButton,
     QStatusBar, QProgressBar, QComboBox, QGroupBox, QFormLayout, QSlider,
     QSpinBox, QCheckBox, QLineEdit, QStyle, QMessageBox, QDialog, QListWidget,
-    QListWidgetItem, QDialogButtonBox, QSystemTrayIcon
+    QListWidgetItem, QDialogButtonBox, QSystemTrayIcon, QRadioButton, QButtonGroup
 )
 
 from heic2any.core.state import JobItem, JobStatus, ExportFormat, AppSettings
@@ -57,6 +57,55 @@ class EnvSelectDialog(QDialog):
         if not it:
             return None
         return it.data(Qt.UserRole)
+
+
+class AppSettingsDialog(QDialog):
+    """应用设置对话框：通知开关与关闭行为选项。"""
+
+    def __init__(self, settings: AppSettings, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("设置")
+        self.resize(420, 220)
+        lay = QVBoxLayout(self)
+
+        # 通知
+        grp_notify = QGroupBox("通知")
+        fl1 = QFormLayout(grp_notify)
+        self.chk_notify = QCheckBox("是否打开通知？")  # 左侧勾选框 + 文案
+        self.chk_notify.setChecked(bool(getattr(settings, 'enable_notifications', True)))
+        fl1.addRow(self.chk_notify)
+
+        # 关闭行为
+        grp_close = QGroupBox("关闭程序行为")
+        fl2 = QFormLayout(grp_close)
+        self.radio_exit = QRadioButton("直接退出")
+        self.radio_min = QRadioButton("最小化后台运行")
+        act = getattr(settings, 'on_close_action', 'ask')
+        if act == 'exit':
+            self.radio_exit.setChecked(True)
+        elif act == 'minimize':
+            self.radio_min.setChecked(True)
+        else:
+            # 默认倾向最小化
+            self.radio_min.setChecked(True)
+        fl2.addRow(self.radio_exit)
+        fl2.addRow(self.radio_min)
+
+        # 按钮
+        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+
+        lay.addWidget(grp_notify)
+        lay.addWidget(grp_close)
+        lay.addStretch(1)
+        lay.addWidget(btns)
+
+    def values(self) -> tuple[bool, str]:
+        """返回(启用通知, 关闭行为)。"""
+        enable = self.chk_notify.isChecked()
+        action = 'minimize' if self.radio_min.isChecked() else 'exit'
+        return enable, action
 
 
 class SignalBus(QObject):
@@ -125,8 +174,7 @@ class MainWindow(QMainWindow):
 
         # 选择的输出目录
         self.output_dir = self.settings.default_output_dir
-        if not os.path.isdir(self.output_dir):
-            os.makedirs(self.output_dir, exist_ok=True)
+        self._ensure_valid_output_dir()
 
         # 内部数据
         self.jobs: List[JobItem] = []
@@ -275,13 +323,16 @@ class MainWindow(QMainWindow):
         btn_add_files = QPushButton("添加文件")
         btn_add_dir = QPushButton("添加文件夹")
         btn_choose_out = QPushButton("选择输出目录")
+        btn_settings = QPushButton("设置")
         btn_add_files.clicked.connect(self._add_files)
         btn_add_dir.clicked.connect(self._add_dir)
         btn_choose_out.clicked.connect(self._choose_output_dir)
+        btn_settings.clicked.connect(self._open_settings)
         header.addWidget(btn_add_files)
         header.addWidget(btn_add_dir)
         header.addStretch(1)
         header.addWidget(btn_choose_out)
+        header.addWidget(btn_settings)
 
         self.queue = QTreeWidget()
         self.queue.setColumnCount(6)
@@ -350,14 +401,26 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "输出目录", f"已将输出目录应用到{changed}个未完成任务")
 
     def _add_files(self) -> None:
+        start_dir = self._ensure_valid_input_dir()
         files, _ = QFileDialog.getOpenFileNames(
-            self, "选择HEIC文件", os.getcwd(), "HEIC 文件 (*.heic *.heif);;所有文件 (*.*)")
+            self, "选择HEIC文件", start_dir, "HEIC 文件 (*.heic *.heif);;所有文件 (*.*)")
         self._append_jobs(files)
+        # 记录最近输入目录
+        if files:
+            base = os.path.dirname(files[0])
+            if os.path.isdir(base):
+                self.settings.last_input_dir = base
+                AppSettings.save(self.settings)
 
     def _add_dir(self) -> None:
-        d = QFileDialog.getExistingDirectory(self, "选择文件夹", os.getcwd())
+        start_dir = self._ensure_valid_input_dir()
+        d = QFileDialog.getExistingDirectory(self, "选择文件夹", start_dir)
         if not d:
             return
+        # 记录最近输入目录
+        if os.path.isdir(d):
+            self.settings.last_input_dir = d
+            AppSettings.save(self.settings)
         paths: List[str] = []
         for root, _, files in os.walk(d):
             for fn in files:
@@ -573,7 +636,11 @@ class MainWindow(QMainWindow):
         if not QSystemTrayIcon.isSystemTrayAvailable():
             return
         self.tray = QSystemTrayIcon(self)
-        icon = self.windowIcon() if not self.windowIcon().isNull() else QIcon()
+        # 托盘图标后备：若应用未设置窗口图标，则使用系统标准图标，避免托盘看不见
+        icon = self.windowIcon()
+        if icon.isNull():
+            from PySide6.QtWidgets import QStyle
+            icon = self.style().standardIcon(QStyle.SP_ComputerIcon)
         self.tray.setIcon(icon)
         menu = QMenu(self)
         act_show = QAction("显示窗口", self)
@@ -620,6 +687,9 @@ class MainWindow(QMainWindow):
 
     def _show_notification(self, title: str, message: str, error: bool = False) -> None:
         try:
+            # 未启用通知则直接返回
+            if not getattr(self.settings, 'enable_notifications', True):
+                return
             if hasattr(self, 'tray') and self.tray and self.tray.isVisible():
                 icon = QSystemTrayIcon.MessageIcon.Critical if error else QSystemTrayIcon.MessageIcon.Information
                 # Windows气泡通知自动消失
@@ -629,14 +699,30 @@ class MainWindow(QMainWindow):
 
     # ---------- 关闭处理 ----------
     def closeEvent(self, event):  # type: ignore
-        # 关闭按钮 → 最小化到托盘，继续后台处理
-        if not self._really_quit and hasattr(self, 'tray') and self.tray.isVisible():
+        # 首次关闭时询问关闭行为
+        action = getattr(self.settings, 'on_close_action', 'ask')
+        if action == 'ask':
+            # 弹窗让用户选择后记录
+            msg = QMessageBox(self)
+            msg.setWindowTitle("关闭行为")
+            msg.setText("选择关闭程序时的行为：")
+            btn_min = msg.addButton("最小化后台运行", QMessageBox.AcceptRole)
+            btn_exit = msg.addButton("直接退出", QMessageBox.DestructiveRole)
+            msg.setIcon(QMessageBox.Question)
+            msg.exec()
+            clicked = msg.clickedButton()
+            action = 'minimize' if clicked == btn_min else 'exit'
+            self.settings.on_close_action = action
+            AppSettings.save(self.settings)
+
+        # 如果托盘可用且设置为最小化，则隐藏到托盘
+        if not self._really_quit and action == 'minimize' and hasattr(self, 'tray') and self.tray.isVisible():
             event.ignore()
             self.hide()
-            # 一次性提示
             self._show_notification("后台运行", "程序已最小化到托盘，继续在后台处理。")
             return
-        # 真正退出
+
+        # 否则直接退出
         try:
             self.task_manager.stop()
         except Exception:
@@ -646,3 +732,40 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
         super().closeEvent(event)
+
+    # ---------- 应用设置与目录校验 ----------
+    def _open_settings(self) -> None:
+        """打开应用设置对话框。"""
+        dlg = AppSettingsDialog(self.settings, self)
+        if dlg.exec() == QDialog.Accepted:
+            enable, action = dlg.values()
+            self.settings.enable_notifications = enable
+            self.settings.on_close_action = action
+            AppSettings.save(self.settings)
+
+    def _ensure_valid_output_dir(self) -> None:
+        """校验输出目录，若不存在则提示并请用户选择新的目录。"""
+        if not os.path.isdir(self.output_dir):
+            QMessageBox.warning(self, "输出目录", "之前的输出目录不存在，请选择新的输出目录。")
+            newd = QFileDialog.getExistingDirectory(self, "选择输出目录", os.getcwd())
+            if newd:
+                self.output_dir = newd
+                self.settings.default_output_dir = newd
+                AppSettings.save(self.settings)
+            else:
+                # 用户取消则创建原目录以保证可用
+                os.makedirs(self.output_dir, exist_ok=True)
+
+    def _ensure_valid_input_dir(self) -> str:
+        """返回用于文件/文件夹选择对话框的起始目录，若上次目录不存在则提示并让用户选择。"""
+        d = self.settings.last_input_dir or os.getcwd()
+        if not os.path.isdir(d):
+            QMessageBox.information(self, "输入目录", "之前的输入目录不存在，请选择新的输入目录。")
+            nd = QFileDialog.getExistingDirectory(self, "选择输入目录", os.getcwd())
+            if nd:
+                self.settings.last_input_dir = nd
+                AppSettings.save(self.settings)
+                d = nd
+            else:
+                d = os.getcwd()
+        return d
