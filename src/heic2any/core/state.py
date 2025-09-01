@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
 from enum import Enum, auto
 from typing import Optional, Tuple
 
@@ -86,15 +86,42 @@ class AppSettings:
     default_threads: int = 4
     default_template: str = "{name}_{index}"
     default_output_dir: str = field(default_factory=lambda: os.path.join(os.getcwd(), 'output'))
+    selected_env_prefix: str = ""
 
     @staticmethod
     def load() -> "AppSettings":
-        # 简化：当前版本用默认，后续可接入 QSettings
+        """从用户目录读取设置；不存在则使用默认。"""
         os.makedirs(os.path.join(os.getcwd(), 'output'), exist_ok=True)
+        try:
+            cfg = _settings_path()
+            if os.path.isfile(cfg):
+                import json
+                with open(cfg, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                s = AppSettings()
+                for k, v in data.items():
+                    if hasattr(s, k):
+                        setattr(s, k, v)
+                return s
+        except Exception:
+            pass
         return AppSettings()
 
     @staticmethod
     def save(s: "AppSettings") -> None:
-        # 简化：当前版本不落盘，后续可接入 QSettings
-        pass
+        """保存到用户目录JSON。"""
+        try:
+            import json
+            cfg = _settings_path()
+            os.makedirs(os.path.dirname(cfg), exist_ok=True)
+            data = asdict(s)
+            with open(cfg, 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
 
+
+def _settings_path() -> str:
+    """设置文件路径：~/.heic2any/settings.json"""
+    home = os.path.expanduser('~')
+    return os.path.join(home, '.heic2any', 'settings.json')

@@ -15,12 +15,13 @@ from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
 from PySide6.QtCore import Qt, QSize, Signal, QObject
-from PySide6.QtGui import QAction
+from PySide6.QtGui import QAction, QIcon, QPixmap, QImage
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QSplitter, QTreeWidget, QTreeWidgetItem, QFileDialog, QMenu, QToolButton,
     QStatusBar, QProgressBar, QComboBox, QGroupBox, QFormLayout, QSlider,
-    QSpinBox, QCheckBox, QLineEdit, QStyle, QMessageBox
+    QSpinBox, QCheckBox, QLineEdit, QStyle, QMessageBox, QDialog, QListWidget,
+    QListWidgetItem, QDialogButtonBox, QSystemTrayIcon
 )
 
 from heic2any.core.state import JobItem, JobStatus, ExportFormat, AppSettings
@@ -28,6 +29,41 @@ from heic2any.core.tasks import TaskManager
 from heic2any.utils.images import make_placeholder_thumbnail, load_thumbnail
 from heic2any.utils.naming import render_output_name
 from heic2any.utils.conda import CondaEnv, find_conda_envs, test_env_dependencies
+
+
+class EnvSelectDialog(QDialog):
+    """Conda环境选择对话框。"""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("选择Conda环境")
+        self.resize(560, 420)
+        lay = QVBoxLayout(self)
+        self.listw = QListWidget()
+        lay.addWidget(self.listw, 1)
+        self.btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        lay.addWidget(self.btns)
+        self.btns.accepted.connect(self.accept)
+        self.btns.rejected.connect(self.reject)
+        # 加载环境
+        envs = find_conda_envs()
+        for e in envs:
+            it = QListWidgetItem(f"{e.name} — {e.prefix}")
+            it.setData(Qt.UserRole, e)
+            self.listw.addItem(it)
+
+    def selected_env(self) -> CondaEnv | None:
+        it = self.listw.currentItem()
+        if not it:
+            return None
+        return it.data(Qt.UserRole)
+
+
+class SignalBus(QObject):
+    """跨线程信号总线：确保UI更新在主线程执行。"""
+    job_update = Signal(int, object)  # (index, JobItem)
+    overall_update = Signal(int, int)
+    thumb_ready = Signal(int, str, object)  # (index, src_path, QImage)
 
 
 class MainWindow(QMainWindow):
@@ -42,10 +78,16 @@ class MainWindow(QMainWindow):
         self.settings = AppSettings.load()
 
         # 任务管理器（并发 + 控制）
+        # 信号总线
+        self.bus = SignalBus(self)
+        self.bus.job_update.connect(self._on_job_update)
+        self.bus.overall_update.connect(self._on_overall_update)
+        self.bus.thumb_ready.connect(self._on_thumb_ready)
+
         self.task_manager = TaskManager(
             threads=self.settings.default_threads,
-            on_job_update=self._on_job_update,
-            on_overall_update=self._on_overall_update,
+            on_job_update=self.bus.job_update.emit,   # 由工作线程发射信号，Qt队列到主线程
+            on_overall_update=self.bus.overall_update.emit,
         )
 
         # 界面
@@ -76,8 +118,8 @@ class MainWindow(QMainWindow):
         self.total_progress.setValue(0)
         self.status.addPermanentWidget(QLabel("总进度"))
         self.status.addPermanentWidget(self.total_progress, 1)
-        self.status.addPermanentWidget(QLabel("剩余：0"))
-        self._status_remaining_label = self.status.children()[-1]
+        self._label_remaining = QLabel("剩余：0")
+        self.status.addPermanentWidget(self._label_remaining)
 
         self.setCentralWidget(root)
 
@@ -89,7 +131,15 @@ class MainWindow(QMainWindow):
         # 内部数据
         self.jobs: List[JobItem] = []
         self._selected_indices: List[int] = []
+        # 缩略图后台线程池（小并发，减少IO阻塞）
+        from concurrent.futures import ThreadPoolExecutor
+        self._thumb_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="thumbs")
         self._start_button_state = "start"  # start|pause|resume
+        self._really_quit = False
+        self._notified_all_done = False
+
+        # 系统托盘
+        self._init_tray()
 
         # 初始化UI状态
         self._refresh_topbar_states()
@@ -153,6 +203,14 @@ class MainWindow(QMainWindow):
         else:
             self._btn_start.setText("继续")
             self._btn_start.setIcon(self.style().standardIcon(QStyle.SP_MediaPlay))
+        # 同步托盘菜单文案
+        if hasattr(self, '_act_tray_toggle'):
+            if self._start_button_state == "start":
+                self._act_tray_toggle.setText("开始")
+            elif self._start_button_state == "pause":
+                self._act_tray_toggle.setText("暂停")
+            else:
+                self._act_tray_toggle.setText("继续")
 
     def _on_click_start_pause_resume(self) -> None:
         if self._start_button_state == "start":
@@ -160,6 +218,7 @@ class MainWindow(QMainWindow):
             self.task_manager.set_threads(self.ins_threads.value())
             self.task_manager.start(self.jobs)
             self._start_button_state = "pause"
+            self._notified_all_done = False
         elif self._start_button_state == "pause":
             self.task_manager.pause()
             self._start_button_state = "resume"
@@ -178,6 +237,7 @@ class MainWindow(QMainWindow):
         self.jobs.clear()
         self.queue.clear()
         self._update_total_progress()
+        self._notified_all_done = False
 
     def _action_reset_defaults(self) -> None:
         self.settings = AppSettings()  # 恢复默认
@@ -191,21 +251,18 @@ class MainWindow(QMainWindow):
         QMessageBox.information(self, "提示", "已将当前检查器作为偏好设置保存")
 
     def _action_choose_env(self) -> None:
-        envs = find_conda_envs()
-        if not envs:
-            QMessageBox.warning(self, "环境", "未发现Conda环境或未安装conda")
-            return
-        items = [f"{e.name} — {e.prefix}" for e in envs]
-        choice, ok = QFileDialog.getSaveFileName(
-            self, "选择环境(仅用于展示选择，实际请在外部切换环境后运行本程序)",
-            initialFilter=items[0] if items else "")
-        # 这里不真正保存路径；提供更简单的依赖检测入口
-        good = 0
-        for env in envs:
+        dlg = EnvSelectDialog(self)
+        if dlg.exec() == QDialog.Accepted:
+            env = dlg.selected_env()
+            if env is None:
+                QMessageBox.information(self, "环境", "未选择环境")
+                return
             okdep, msg = test_env_dependencies(env)
-            if okdep:
-                good += 1
-        QMessageBox.information(self, "环境检测", f"发现{len(envs)}个环境，其中依赖就绪{good}个")
+            # 保存到设置
+            self.settings.selected_env_prefix = env.prefix
+            AppSettings.save(self.settings)
+            tip = f"已选择环境：{env.name}\n路径：{env.prefix}\n依赖检测：{msg}"
+            QMessageBox.information(self, "环境", tip)
 
     # ---------- 左侧文件队列 ----------
     def _build_queue(self) -> QWidget:
@@ -276,7 +333,21 @@ class MainWindow(QMainWindow):
         d = QFileDialog.getExistingDirectory(self, "选择输出目录", self.output_dir)
         if d:
             self.output_dir = d
+            # 保存到设置并应用到队列中的待处理任务
+            self.settings.default_output_dir = d
+            AppSettings.save(self.settings)
+            self._apply_output_dir_to_jobs()
             self._refresh_inspector_preview()
+
+    def _apply_output_dir_to_jobs(self) -> None:
+        """将当前选择的输出目录应用到队列中的未完成任务。"""
+        changed = 0
+        for j in self.jobs:
+            if j.status in (JobStatus.WAITING, JobStatus.PAUSED):
+                j.export_dir = self.output_dir
+                changed += 1
+        if changed:
+            QMessageBox.information(self, "输出目录", f"已将输出目录应用到{changed}个未完成任务")
 
     def _add_files(self) -> None:
         files, _ = QFileDialog.getOpenFileNames(
@@ -313,10 +384,18 @@ class MainWindow(QMainWindow):
         it = QTreeWidgetItem(["", os.path.basename(job.src_path), job.size_text(), job.status_text(), "0%", ""]) 
         it.setData(0, Qt.UserRole, index)
         # 缩略图
-        pix = load_thumbnail(job.src_path)
-        if pix is None:
-            pix = make_placeholder_thumbnail()
-        it.setIcon(0, pix)
+        # 先放占位，避免阻塞UI
+        placeholder = make_placeholder_thumbnail()
+        it.setIcon(0, QIcon(placeholder))
+        # 异步加载真实缩略图（QImage），回到主线程设置
+        idx = index
+        src = job.src_path
+        def _load_and_emit():
+            img: QImage | None = load_thumbnail(src)
+            if img is not None:
+                # 通过Qt信号回到UI线程
+                self.bus.thumb_ready.emit(idx, src, img)
+        self._thumb_pool.submit(_load_and_emit)
         return it
 
     # ---------- 右侧检查器 ----------
@@ -451,17 +530,119 @@ class MainWindow(QMainWindow):
         it.setText(3, job.status_text())
         it.setText(4, f"{job.progress}%")
         it.setText(5, job.error or "")
+        # 出错弹出通知（后台可见）
+        if job.status == JobStatus.FAILED and job.error:
+            base = os.path.basename(job.src_path)
+            self._show_notification("转换失败", f"{base}: {job.error}", error=True)
 
     def _on_overall_update(self, total_progress: int, remaining: int) -> None:
         # 由UI侧统一统计总进度，忽略传入值
         self._update_total_progress()
 
+    def _on_thumb_ready(self, idx: int, src_path: str, img: QImage) -> None:
+        # 验证索引与路径，避免因队列变化导致错配
+        if idx < 0 or idx >= len(self.jobs):
+            return
+        if self.jobs[idx].src_path != src_path:
+            return
+        it = self.queue.topLevelItem(idx)
+        if not it:
+            return
+        pix = QPixmap.fromImage(img)
+        it.setIcon(0, QIcon(pix))
+
     def _update_total_progress(self) -> None:
         total = len(self.jobs)
         if total == 0:
             self.total_progress.setValue(0)
-            self._status_remaining_label.setText("剩余：0")
+            self._label_remaining.setText("剩余：0")
             return
         done = sum(1 for j in self.jobs if j.status in (JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED))
         self.total_progress.setValue(int(100 * done / total))
-        self._status_remaining_label.setText(f"剩余：{total - done}")
+        self._label_remaining.setText(f"剩余：{total - done}")
+        # 全部完成时弹出通知（只弹一次）
+        if done == total and total > 0 and not self._notified_all_done:
+            succ = sum(1 for j in self.jobs if j.status == JobStatus.COMPLETED)
+            fail = sum(1 for j in self.jobs if j.status == JobStatus.FAILED)
+            canc = sum(1 for j in self.jobs if j.status == JobStatus.CANCELLED)
+            self._show_notification("处理完成", f"共{total}项：成功{succ}，失败{fail}，取消{canc}")
+            self._notified_all_done = True
+
+    # ---------- 托盘与后台 ----------
+    def _init_tray(self) -> None:
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            return
+        self.tray = QSystemTrayIcon(self)
+        icon = self.windowIcon() if not self.windowIcon().isNull() else QIcon()
+        self.tray.setIcon(icon)
+        menu = QMenu(self)
+        act_show = QAction("显示窗口", self)
+        act_show.triggered.connect(self._restore_from_tray)
+        self._act_tray_toggle = QAction("开始", self)
+        self._act_tray_toggle.triggered.connect(self._on_click_start_pause_resume)
+        act_stop = QAction("停止", self)
+        act_stop.triggered.connect(self._on_click_stop)
+        act_exit = QAction("退出", self)
+        act_exit.triggered.connect(self._tray_exit)
+        menu.addAction(act_show)
+        menu.addSeparator()
+        menu.addAction(self._act_tray_toggle)
+        menu.addAction(act_stop)
+        menu.addSeparator()
+        menu.addAction(act_exit)
+        self.tray.setContextMenu(menu)
+        self.tray.activated.connect(self._on_tray_activated)
+        self.tray.show()
+        # 初始状态同步
+        self._refresh_topbar_states()
+
+    def _on_tray_activated(self, reason):  # type: ignore
+        if reason == QSystemTrayIcon.ActivationReason.DoubleClick:
+            self._restore_from_tray()
+
+    def _restore_from_tray(self) -> None:
+        self.showNormal()
+        self.activateWindow()
+
+    def _tray_exit(self) -> None:
+        # 托盘菜单退出：真正退出应用
+        self._really_quit = True
+        try:
+            self.task_manager.stop()
+        except Exception:
+            pass
+        try:
+            self._thumb_pool.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            pass
+        from PySide6.QtWidgets import QApplication
+        QApplication.instance().quit()
+
+    def _show_notification(self, title: str, message: str, error: bool = False) -> None:
+        try:
+            if hasattr(self, 'tray') and self.tray and self.tray.isVisible():
+                icon = QSystemTrayIcon.MessageIcon.Critical if error else QSystemTrayIcon.MessageIcon.Information
+                # Windows气泡通知自动消失
+                self.tray.showMessage(title, message, icon, 4000)
+        except Exception:
+            pass
+
+    # ---------- 关闭处理 ----------
+    def closeEvent(self, event):  # type: ignore
+        # 关闭按钮 → 最小化到托盘，继续后台处理
+        if not self._really_quit and hasattr(self, 'tray') and self.tray.isVisible():
+            event.ignore()
+            self.hide()
+            # 一次性提示
+            self._show_notification("后台运行", "程序已最小化到托盘，继续在后台处理。")
+            return
+        # 真正退出
+        try:
+            self.task_manager.stop()
+        except Exception:
+            pass
+        try:
+            self._thumb_pool.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            pass
+        super().closeEvent(event)

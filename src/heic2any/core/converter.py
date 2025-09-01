@@ -106,6 +106,6 @@ def convert_one(
         elif f in ("tif", "tiff"):
             save_kwargs.update({"compression": "tiff_deflate"})
 
-        im.save(dst_path, format=f.upper(), **save_kwargs)
+        # 让Pillow按扩展名自动识别格式，可避免'JPG'等大小写映射问题
+        im.save(dst_path, **save_kwargs)
         return (tw, th)
-
