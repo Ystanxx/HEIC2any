@@ -1,15 +1,60 @@
-/* 简洁QSS，保证清晰易读 */
-QMainWindow {
-    background: #fafafa;
+/* 全局基础配色与控件统一尺寸 */
+QMainWindow { background: #ffffff; }
+
+/* 右侧设置面板背景与内边距建议在代码中通过对象名控制 */
+QWidget#rightPanel { background: #FAFAFA; }
+
+/* 卡片化容器（使用对象名 card） */
+QWidget#card {
+    background: #ffffff;
+    border: 1px solid #E5E7EB;
+    border-radius: 10px;
 }
-QTreeWidget::item:selected {
-    background: #e6f2ff;
+QLabel.card-title { font-weight: 600; }
+
+/* 控件统一高度与圆角 */
+QLineEdit, QComboBox, QSpinBox, QToolButton, QPushButton {
+    min-height: 32px;
+    border-radius: 8px;
+    border: 1px solid #D1D5DB;
+    background: #ffffff;
 }
-QGroupBox {
-    font-weight: 600;
-    margin-top: 8px;
+QPushButton:pressed, QToolButton:pressed {
+    background: #E5E7EB;
+    padding-top: 1px; /* 伪3D 下陷效果 */
+    padding-left: 1px;
 }
-QGroupBox::title {
-    subcontrol-origin: margin;
-    left: 8px;
+
+/* 链接样式按钮（更多设置…） */
+QPushButton.link {
+    color: #1f6feb;
+    background: transparent;
+    border: none;
+    padding: 0 4px;
 }
+QPushButton.link:hover { text-decoration: underline; }
+
+/* Start/Stop 主次按钮风格（通过对象名绑定） */
+QPushButton#btnStart {
+    background: #2563eb; /* 主色 */
+    color: #ffffff;
+}
+QPushButton#btnStart:hover { background: #1d4ed8; }
+QPushButton#btnStop {
+    background: transparent;
+    color: #dc2626;
+    border: 1px solid #dc2626;
+}
+QPushButton#btnStop:hover { background: rgba(220,38,38,0.08); }
+
+/* 文件列表行高、缩略图尺寸与选中态 */
+QTreeView::item { height: 56px; }
+QTreeWidget { alternate-background-color: #fafafa; }
+QTreeWidget::item:selected { background: #e6f2ff; }
+
+/* 进度条细条样式 */
+QProgressBar { height: 6px; border-radius: 3px; background: #E5E7EB; }
+QProgressBar::chunk { background: #22c55e; border-radius: 3px; }
+
+/* 小型步进按钮（尺寸/线程用） */
+QToolButton#stepBtn { min-width: 32px; padding: 2px 6px; border-radius: 6px; }
