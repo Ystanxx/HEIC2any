@@ -23,7 +23,8 @@ class JobStatus(Enum):
 
 class ExportFormat:
     """导出格式的展示与取值映射。"""
-    VALUES = ["jpg", "jpeg", "png", "tif"]
+    # 增加主流格式：webp、tiff（保留tif以兼容）
+    VALUES = ["jpg", "jpeg", "png", "tif", "tiff", "webp"]
 
     @classmethod
     def list_display(cls):
@@ -36,7 +37,8 @@ class JobItem:
     src_path: str
     export_dir: str
     export_format: str = "jpg"
-    quality: int = 90
+    quality: int = 90  # 通用质量（JPG/WEBP等）
+    png_compress_level: int = 6  # PNG压缩级别 0-9（9最小体积最慢）
     dpi: Tuple[int, int] = (300, 300)
     req_size: Tuple[int, int] = (0, 0)  # 0 表示不指定
     keep_aspect: bool = True
@@ -54,7 +56,6 @@ class JobItem:
     def from_source(path: str) -> "JobItem":
         # 初始导出目录设为当前工作目录下的 output
         out = os.path.join(os.getcwd(), 'output')
-        os.makedirs(out, exist_ok=True)
         return JobItem(src_path=path, export_dir=out)
 
     def size_text(self) -> str:
@@ -80,6 +81,7 @@ class AppSettings:
     """应用全局设置（可持久化）。"""
     default_format: str = "jpg"
     default_quality: int = 90
+    default_png_compress_level: int = 6
     default_dpi: Tuple[int, int] = (300, 300)
     default_size: Tuple[int, int] = (0, 0)
     default_keep_aspect: bool = True
@@ -98,7 +100,6 @@ class AppSettings:
     @staticmethod
     def load() -> "AppSettings":
         """从用户目录读取设置；不存在则使用默认。"""
-        os.makedirs(os.path.join(os.getcwd(), 'output'), exist_ok=True)
         try:
             cfg = _settings_path()
             if os.path.isfile(cfg):

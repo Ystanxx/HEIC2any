@@ -10,7 +10,7 @@
 from __future__ import annotations
 
 import os
-from typing import Tuple
+from typing import Tuple, Optional
 
 
 def _import_image_libs():
@@ -51,6 +51,7 @@ def convert_one(
     dpi: Tuple[int, int],
     req_size: Tuple[int, int],
     keep_aspect: bool,
+    png_compress_level: Optional[int] = None,
 ) -> Tuple[int, int]:
     """执行单张图片转换。
 
@@ -102,9 +103,16 @@ def convert_one(
         if f in ("jpg", "jpeg"):
             save_kwargs.update({"quality": max(1, min(100, quality)), "optimize": True})
         elif f == "png":
-            save_kwargs.update({"compress_level": _map_png_quality_to_compress_level(quality)})
+            if png_compress_level is None:
+                level = _map_png_quality_to_compress_level(quality)
+            else:
+                level = max(0, min(9, int(png_compress_level)))
+            save_kwargs.update({"compress_level": level})
         elif f in ("tif", "tiff"):
             save_kwargs.update({"compression": "tiff_deflate"})
+        elif f == "webp":
+            # WebP质量：1-100，数值越大画质越好
+            save_kwargs.update({"quality": max(1, min(100, quality))})
 
         # 让Pillow按扩展名自动识别格式，可避免'JPG'等大小写映射问题
         im.save(dst_path, **save_kwargs)

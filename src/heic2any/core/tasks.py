@@ -108,6 +108,7 @@ class TaskManager:
                 dpi=job.dpi,
                 req_size=job.req_size,
                 keep_aspect=job.keep_aspect,
+                png_compress_level=job.png_compress_level if job.export_format.lower() == 'png' else None,
             )
             job.orig_size = (w, h)
             job.progress = 100

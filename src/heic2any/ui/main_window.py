@@ -21,7 +21,7 @@ from PySide6.QtWidgets import (
     QSplitter, QTreeWidget, QTreeWidgetItem, QFileDialog, QMenu, QToolButton,
     QStatusBar, QProgressBar, QComboBox, QGroupBox, QFormLayout, QSlider,
     QSpinBox, QCheckBox, QLineEdit, QStyle, QMessageBox, QDialog, QListWidget,
-    QListWidgetItem, QDialogButtonBox, QSystemTrayIcon, QRadioButton
+    QListWidgetItem, QDialogButtonBox, QSystemTrayIcon, QRadioButton, QStackedWidget, QSizePolicy
 )
 
 from heic2any.core.state import JobItem, JobStatus, ExportFormat, AppSettings
@@ -198,7 +198,7 @@ class MainWindow(QMainWindow):
 
         # 选择的输出目录
         self.output_dir = self.settings.default_output_dir
-        self._ensure_valid_output_dir()
+        # 启动时不主动创建/弹窗，仅记录路径；在开始转换或用户主动修改时再校验
 
         # 内部数据
         self.jobs: List[JobItem] = []
@@ -500,19 +500,50 @@ class MainWindow(QMainWindow):
         self.ins_format = QComboBox()
         for fmt in ExportFormat.list_display():
             self.ins_format.addItem(fmt)
-        self.ins_quality = QSlider(Qt.Horizontal)
-        self.ins_quality.setRange(1, 100)
-        self.ins_quality.setValue(90)
-        self.ins_quality_lbl = QLabel("90")
-        self.ins_quality.valueChanged.connect(lambda v: self.ins_quality_lbl.setText(str(v)))
-        qrow = QWidget(); qlay = QHBoxLayout(qrow); qlay.setContentsMargins(0,0,0,0)
-        qlay.addWidget(self.ins_quality, 1); qlay.addWidget(self.ins_quality_lbl)
+        form1.addRow("格式", self.ins_format)
+
+        # 参数区使用堆叠面板以保持组框尺寸稳定
+        self.ins_param_stack = QStackedWidget()
+        self.ins_param_stack.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+
+        # JPEG/JPG 参数页：质量 1-95
+        page_jpeg = QWidget(); pjlay = QFormLayout(page_jpeg)
+        self.jpeg_quality = QSlider(Qt.Horizontal); self.jpeg_quality.setRange(1, 95); self.jpeg_quality.setValue(90)
+        self.jpeg_quality_lbl = QLabel("90")
+        self.jpeg_quality.valueChanged.connect(lambda v: self.jpeg_quality_lbl.setText(str(v)))
+        row_jq = QWidget(); rjql = QHBoxLayout(row_jq); rjql.setContentsMargins(0,0,0,0)
+        rjql.addWidget(self.jpeg_quality, 1); rjql.addWidget(self.jpeg_quality_lbl)
+        pjlay.addRow("质量", row_jq)
+
+        # PNG 参数页：compress_level 0-9
+        page_png = QWidget(); pplay = QFormLayout(page_png)
+        self.png_level = QSlider(Qt.Horizontal); self.png_level.setRange(0, 9); self.png_level.setValue(6)
+        self.png_level_lbl = QLabel("6")
+        self.png_level.valueChanged.connect(lambda v: self.png_level_lbl.setText(str(v)))
+        row_pl = QWidget(); rpll = QHBoxLayout(row_pl); rpll.setContentsMargins(0,0,0,0)
+        rpll.addWidget(self.png_level, 1); rpll.addWidget(self.png_level_lbl)
+        pplay.addRow("压缩等级(0-9)", row_pl)
+
+        # 其他格式（WEBP/TIFF等）：通用质量 1-100
+        page_other = QWidget(); polay = QFormLayout(page_other)
+        self.other_quality = QSlider(Qt.Horizontal); self.other_quality.setRange(1, 100); self.other_quality.setValue(90)
+        self.other_quality_lbl = QLabel("90")
+        self.other_quality.valueChanged.connect(lambda v: self.other_quality_lbl.setText(str(v)))
+        row_oq = QWidget(); roql = QHBoxLayout(row_oq); roql.setContentsMargins(0,0,0,0)
+        roql.addWidget(self.other_quality, 1); roql.addWidget(self.other_quality_lbl)
+        polay.addRow("质量", row_oq)
+
+        self.ins_param_stack.addWidget(page_jpeg)   # index 0
+        self.ins_param_stack.addWidget(page_png)    # index 1
+        self.ins_param_stack.addWidget(page_other)  # index 2
+
+        # 固定高度为三页中的最大，避免切换时尺寸跳动
+        h = max(page_jpeg.sizeHint().height(), page_png.sizeHint().height(), page_other.sizeHint().height())
+        self.ins_param_stack.setFixedHeight(h)
+        form1.addRow("参数", self.ins_param_stack)
 
         self.ins_dpi_x = QSpinBox(); self.ins_dpi_x.setRange(50, 600); self.ins_dpi_x.setValue(300)
         self.ins_dpi_y = QSpinBox(); self.ins_dpi_y.setRange(50, 600); self.ins_dpi_y.setValue(300)
-
-        form1.addRow("格式", self.ins_format)
-        form1.addRow("质量", qrow)
         form1.addRow("DPI-X", self.ins_dpi_x)
         form1.addRow("DPI-Y", self.ins_dpi_y)
 
@@ -558,12 +589,17 @@ class MainWindow(QMainWindow):
         lay.addWidget(grp_misc)
         lay.addStretch(1)
         self._load_settings_into_inspector()
+        self.ins_format.currentTextChanged.connect(self._on_format_changed)
+        self._on_format_changed(self.ins_format.currentText())
         return w
 
     def _load_settings_into_inspector(self) -> None:
         # 将当前AppSettings装载进检查器
         self.ins_format.setCurrentText(self.settings.default_format)
-        self.ins_quality.setValue(self.settings.default_quality)
+        # 三页的默认值
+        self.jpeg_quality.setValue(min(95, max(1, self.settings.default_quality)))
+        self.png_level.setValue(max(0, min(9, getattr(self.settings, 'default_png_compress_level', 6))))
+        self.other_quality.setValue(min(100, max(1, self.settings.default_quality)))
         self.ins_dpi_x.setValue(self.settings.default_dpi[0])
         self.ins_dpi_y.setValue(self.settings.default_dpi[1])
         self.ins_width.setValue(self.settings.default_size[0])
@@ -575,7 +611,14 @@ class MainWindow(QMainWindow):
     def _apply_inspector_to_defaults(self) -> None:
         # 将检查器值保存为默认设置
         self.settings.default_format = self.ins_format.currentText()
-        self.settings.default_quality = self.ins_quality.value()
+        # 当前格式对应的默认值写回
+        fmt = self.ins_format.currentText().lower()
+        if fmt in ("jpg", "jpeg"):
+            self.settings.default_quality = self.jpeg_quality.value()
+        elif fmt == "png":
+            self.settings.default_png_compress_level = self.png_level.value()
+        else:
+            self.settings.default_quality = self.other_quality.value()
         self.settings.default_dpi = (self.ins_dpi_x.value(), self.ins_dpi_y.value())
         self.settings.default_size = (self.ins_width.value(), self.ins_height.value())
         self.settings.default_keep_aspect = self.ins_keep_aspect.isChecked()
@@ -601,13 +644,31 @@ class MainWindow(QMainWindow):
             return
         for idx in self._selected_indices:
             job = self.jobs[idx]
-            job.export_format = self.ins_format.currentText()
-            job.quality = self.ins_quality.value()
+            fmt = self.ins_format.currentText().lower()
+            job.export_format = fmt
+            if fmt in ("jpg", "jpeg"):
+                job.quality = self.jpeg_quality.value()
+            elif fmt == "png":
+                job.png_compress_level = self.png_level.value()
+                # 保留质量用于其他用途，但不影响PNG保存
+                job.quality = self.other_quality.value()
+            else:
+                job.quality = self.other_quality.value()
             job.dpi = (self.ins_dpi_x.value(), self.ins_dpi_y.value())
             job.req_size = (self.ins_width.value(), self.ins_height.value())
             job.keep_aspect = self.ins_keep_aspect.isChecked()
             job.template = self.ins_template.text()
         QMessageBox.information(self, "提示", "已应用到选中项")
+
+    def _on_format_changed(self, fmt: str) -> None:
+        f = (fmt or "").lower()
+        # 切换堆叠页
+        if f in ("jpg", "jpeg"):
+            self.ins_param_stack.setCurrentIndex(0)
+        elif f == "png":
+            self.ins_param_stack.setCurrentIndex(1)
+        else:
+            self.ins_param_stack.setCurrentIndex(2)
 
     # ---------- 任务回调、状态更新 ----------
     def _on_job_update(self, job_index: int, job: JobItem) -> None:
@@ -670,6 +731,16 @@ class MainWindow(QMainWindow):
 
         返回：是否继续开始任务。
         """
+        # 启动前先校验输出目录是否存在
+        if not os.path.isdir(self.output_dir):
+            QMessageBox.warning(self, "输出目录", "当前输出目录不存在，请选择新的输出目录。")
+            newd = QFileDialog.getExistingDirectory(self, "选择输出目录", os.getcwd())
+            if not newd:
+                return False
+            self.output_dir = newd
+            self.settings.default_output_dir = newd
+            AppSettings.save(self.settings)
+            self._apply_output_dir_to_jobs()
         # 收集冲突列表（仅检测磁盘已存在的文件）
         conflicts: list[tuple[int, str]] = []  # (job_index, out_path)
         for idx, job in enumerate(self.jobs):
@@ -854,17 +925,8 @@ class MainWindow(QMainWindow):
             AppSettings.save(self.settings)
 
     def _ensure_valid_output_dir(self) -> None:
-        """校验输出目录，若不存在则提示并请用户选择新的目录。"""
-        if not os.path.isdir(self.output_dir):
-            QMessageBox.warning(self, "输出目录", "之前的输出目录不存在，请选择新的输出目录。")
-            newd = QFileDialog.getExistingDirectory(self, "选择输出目录", os.getcwd())
-            if newd:
-                self.output_dir = newd
-                self.settings.default_output_dir = newd
-                AppSettings.save(self.settings)
-            else:
-                # 用户取消则创建原目录以保证可用
-                os.makedirs(self.output_dir, exist_ok=True)
+        """保留占位以兼容旧调用（已不在启动时强制创建）。"""
+        return
 
     def _ensure_valid_input_dir(self) -> str:
         """返回用于文件/文件夹选择对话框的起始目录，若上次目录不存在则提示并让用户选择。"""
