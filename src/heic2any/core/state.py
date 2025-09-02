@@ -10,6 +10,8 @@ from dataclasses import dataclass, field, asdict
 from enum import Enum, auto
 from typing import Optional, Tuple
 
+from heic2any.core.cancellation import CancellationToken
+
 
 class JobStatus(Enum):
     """任务状态。"""
@@ -19,6 +21,20 @@ class JobStatus(Enum):
     COMPLETED = auto()
     FAILED = auto()
     CANCELLED = auto()
+
+
+class JobState(Enum):
+    """更清晰的外部状态命名（别名）。
+
+    说明：保持向后兼容，内部仍使用 JobStatus；如需对外表达，可转换：
+    QUEUED <-> WAITING；CANCELED <-> CANCELLED
+    """
+    QUEUED = JobStatus.WAITING.value
+    RUNNING = JobStatus.RUNNING.value
+    PAUSED = JobStatus.PAUSED.value
+    COMPLETED = JobStatus.COMPLETED.value
+    FAILED = JobStatus.FAILED.value
+    CANCELED = JobStatus.CANCELLED.value
 
 
 class ExportFormat:
@@ -64,6 +80,9 @@ class JobItem:
     webp_method: int = 4  # 0-6
     # TIFF
     tiff_compression: str = "tiff_deflate"  # tiff_deflate/tiff_lzw/tiff_adobe_deflate
+
+    # 取消令牌（每个任务持有）
+    token: CancellationToken = field(default_factory=CancellationToken)
 
     @staticmethod
     def from_source(path: str) -> "JobItem":

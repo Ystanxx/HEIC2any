@@ -27,6 +27,7 @@ from PySide6.QtWidgets import QAbstractSpinBox
 
 from heic2any.core.state import JobItem, JobStatus, ExportFormat, AppSettings
 from heic2any.core.tasks import TaskManager
+from heic2any.core.event_bus import EventBus, EventType
 from heic2any.utils.images import make_placeholder_thumbnail, load_thumbnail, get_image_size
 from heic2any.utils.naming import render_output_name, build_output_path
 from heic2any.utils.conda import CondaEnv, find_conda_envs, test_env_dependencies, find_system_pythons
@@ -318,16 +319,22 @@ class MainWindow(QMainWindow):
         self.settings = AppSettings.load()
 
         # 任务管理器（并发 + 控制）
-        # 信号总线
+        # 信号总线（Qt UI线程）
         self.bus = SignalBus(self)
         self.bus.job_update.connect(self._on_job_update)
         self.bus.overall_update.connect(self._on_overall_update)
         self.bus.thumb_ready.connect(self._on_thumb_ready)
 
+        # 核心事件总线（跨线程），控制层仅发布事件；此处桥接到Qt信号用于UI渲染
+        self.core_bus = EventBus()
+        self.core_bus.subscribe(EventType.JOB_UPDATED, lambda d: self.bus.job_update.emit(int(d.get('index', -1)), d.get('job')))
+        self.core_bus.subscribe(EventType.OVERALL_UPDATED, lambda _d: self.bus.overall_update.emit(0, 0))
+
         self.task_manager = TaskManager(
             threads=self.settings.default_threads,
-            on_job_update=self.bus.job_update.emit,   # 由工作线程发射信号，Qt队列到主线程
-            on_overall_update=self.bus.overall_update.emit,
+            on_job_update=lambda *_: None,              # 统一走 EventBus
+            on_overall_update=lambda *_: None,
+            event_bus=self.core_bus,
         )
 
         # 界面
