@@ -395,6 +395,8 @@ class MainWindow(QMainWindow):
         # 缩略图缓存与标签引用（按行索引）
         self._thumb_cache: dict[int, QImage] = {}
         self._thumb_labels: dict[int, QLabel] = {}
+        # 正在加载的索引，避免重复提交
+        self._thumb_loading: set[int] = set()
         # 缩略图缓存
         self._thumb_cache: dict[int, QImage] = {}
 
@@ -610,6 +612,12 @@ class MainWindow(QMainWindow):
             pass
         # 空状态提示覆盖到列表内部，允许拖拽到列表
         self._empty = QLabel("拖拽或点击添加文件", self.queue.viewport())
+        # 允许点击透传到列表视口，避免覆盖层拦截鼠标事件
+        try:
+            self._empty.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+            self._empty.setAlignment(Qt.AlignCenter)
+        except Exception:
+            pass
         self._empty.setAlignment(Qt.AlignCenter)
         self._empty.setStyleSheet("color:#9CA3AF; font-size:14px;")
         self._empty.setAttribute(Qt.WA_TransparentForMouseEvents, True)
@@ -630,6 +638,14 @@ class MainWindow(QMainWindow):
 
         # 允许点击列表空白区域弹出选择菜单（添加文件/文件夹）
         self.queue.viewport().installEventFilter(self)
+        try:
+            # 监听滚动条，滚动时节流触发可视缩略图加载
+            from PySide6.QtCore import QTimer
+            self._thumb_vis_timer = QTimer(self); self._thumb_vis_timer.setSingleShot(True)
+            self.queue.verticalScrollBar().valueChanged.connect(lambda _v: (self._thumb_vis_timer.start(60)))
+            self._thumb_vis_timer.timeout.connect(self._ensure_visible_thumbs)
+        except Exception:
+            pass
 
         lay.addLayout(header)
         lay.addWidget(self.queue, 1)
@@ -675,12 +691,33 @@ class MainWindow(QMainWindow):
     def eventFilter(self, obj, event):  # type: ignore
         # 点击左侧空白区域：左键→直接选择文件；右键→弹出菜单（文件/文件夹）
         try:
-            if obj is self.queue.viewport() and event.type() == QEvent.MouseButtonRelease and event.buttons() == Qt.NoButton:
-                pos = event.pos()
-                # 若点击位置没有条目，则展示菜单
-                if self.queue.itemAt(pos) is None:
-                    if event.button() == Qt.RightButton:
-                        menu = QMenu(self)
+            if obj is self.queue.viewport():
+                # 滚动/重绘/鼠标释放时确保可视行的缩略图已请求加载
+                if event.type() in (QEvent.Paint, QEvent.Wheel, QEvent.Resize):
+                    self._ensure_visible_thumbs()
+                # 空白区域按下即触发（左键打开、右键菜单），避免仅在释放时偶发未触发
+                if event.type() == QEvent.MouseButtonPress:
+                    pos = event.pos()
+                    if self.queue.itemAt(pos) is None:
+                        if event.button() == Qt.RightButton:
+                            menu = QMenu(self)
+                            act_files = QAction("添加文件", self)
+                            act_files.triggered.connect(self._add_files)
+                            act_dir = QAction("添加文件夹", self)
+                            act_dir.triggered.connect(self._add_dir)
+                            menu.addAction(act_files)
+                            menu.addAction(act_dir)
+                            gp = self.queue.viewport().mapToGlobal(pos)
+                            menu.exec(gp)
+                        else:
+                            self._add_files()
+                        return True
+                if event.type() == QEvent.MouseButtonRelease and event.buttons() == Qt.NoButton:
+                    pos = event.pos()
+                    # 若点击位置没有条目，则展示菜单
+                    if self.queue.itemAt(pos) is None:
+                        if event.button() == Qt.RightButton:
+                            menu = QMenu(self)
                         act_files = QAction("添加文件", self)
                         act_files.triggered.connect(self._add_files)
                         act_dir = QAction("添加文件夹", self)
@@ -855,6 +892,11 @@ class MainWindow(QMainWindow):
             added += 1
         if added > 0:
             self._update_empty_placeholder()
+            # 初次添加后，确保可见区域的缩略图被请求加载
+            try:
+                self._ensure_visible_thumbs()
+            except Exception:
+                pass
         if added == 0:
             self._show_info("未添加任何HEIC文件")
         self._update_total_progress()
@@ -864,25 +906,7 @@ class MainWindow(QMainWindow):
         it.setData(0, Qt.UserRole, index)
         it.setTextAlignment(6, Qt.AlignHCenter | Qt.AlignVCenter)
         # 异步加载真实缩略图（QImage），回到主线程设置
-        idx = index
-        src = job.src_path
-        # 预估缩略图目标尺寸（放大2倍，保证清晰；上限512）
-        req_side = min(512, max(64, self._thumb_target_width() * 2))
-
-        def _load_and_emit():
-            img: QImage | None = load_thumbnail(src, req_side)
-            if img is not None:
-                # 通过Qt信号回到UI线程
-                self.bus.thumb_ready.emit(idx, src, img)
-            # 异步读取尺寸（轻量元数据），回到UI线程更新
-            sz = get_image_size(src)
-            if sz is not None:
-                job.orig_size = sz
-                try:
-                    self.bus.job_update.emit(idx, job)
-                except Exception:
-                    pass
-        self._thumb_pool.submit(_load_and_emit)
+        self._request_thumb_for(index)
         return it
 
     # ---------- 右侧检查器 ----------
@@ -1134,25 +1158,77 @@ class MainWindow(QMainWindow):
             x /= 1024.0
 
     def _estimate_output_text(self, job: JobItem) -> str:
-        """基于源文件大小与当前导出设置的粗略估算，不解码图片，避免卡顿。"""
-        if not getattr(job, 'src_bytes', 0):
-            return "-"
-        fmt = (job.export_format or '').lower()
-        size = job.src_bytes
-        ratio = 1.0
+        """基于导出参数的粗略体积估算（避免解码）。
+
+        修正点：PNG 的体积与源文件大小弱相关（HEIC→PNG会剧增），
+        优先使用像素尺寸估算 raw 大小：raw ~= w*h*3（RGB 8bit），再按压缩等级折算。
+        其余格式维持轻量启发式，避免卡顿。
+        """
+        fmt = (getattr(job, 'export_format', '') or '').lower()
+
+        # 目标像素尺寸（若有缩放优先用目标尺寸）
+        w, h = 0, 0
         try:
-            if fmt in ('jpg','jpeg'):
-                q = max(1, min(100, job.quality))
-                ratio = 0.6 + 1.2*(q/100.0)  # 0.6 .. 1.8
-            elif fmt == 'png':
-                lvl = getattr(job, 'png_compress_level', 6)
-                ratio = 1.6 - 0.1*max(0, min(9, int(lvl)))  # ~1.6 .. 0.7
+            rw, rh = getattr(job, 'req_size', (0, 0))
+            ow, oh = getattr(job, 'orig_size', (0, 0))
+            if rw or rh:
+                # 按 converter 中的规则进行等比推导
+                if getattr(job, 'keep_aspect', True):
+                    if rw > 0 and rh == 0 and ow > 0:
+                        # 仅宽，等比求高
+                        h = int(round((oh or 0) * (rw / float(max(1, ow)))))
+                        w = rw
+                    elif rh > 0 and rw == 0 and oh > 0:
+                        # 仅高，等比求宽
+                        w = int(round((ow or 0) * (rh / float(max(1, oh)))))
+                        h = rh
+                    elif rw > 0 and rh > 0 and ow > 0:
+                        # 同时给定，仍以宽为基准
+                        h = int(round((oh or 0) * (rw / float(max(1, ow)))))
+                        w = rw
+                    else:
+                        w, h = ow, oh
+                else:
+                    # 非等比拉伸
+                    w = rw or (ow or 0)
+                    h = rh or (oh or 0)
+            else:
+                w, h = ow, oh
+        except Exception:
+            w, h = 0, 0
+
+        # PNG：基于像素尺寸进行估算，解决严重低估问题
+        if fmt == 'png' and w > 0 and h > 0:
+            lvl = int(getattr(job, 'png_compress_level', 6) or 0)
+            lvl = max(0, min(9, lvl))
+            # 原始大小：RGB 每像素3字节，外加少量固定开销
+            raw = w * h * 3
+            overhead = 64 * 1024  # PNG 头/块等开销近似
+            # 压缩系数表（经验值，照片类内容）：0=1.00（无压缩）…9≈0.40
+            ratio_table = [1.00, 0.92, 0.85, 0.80, 0.75, 0.70, 0.60, 0.52, 0.46, 0.40]
+            ratio = ratio_table[lvl]
+            if bool(getattr(job, 'png_optimize', False)):
+                ratio *= 0.95
+            est = int(raw * ratio + overhead)
+            return self._human_bytes(est)
+
+        # 其他格式：退化到启发式（仍考虑尺寸缺失时的容错）
+        size = int(getattr(job, 'src_bytes', 0) or 0)
+        if size <= 0:
+            # 若没有源大小，则无法估算
+            return "-"
+        try:
+            if fmt in ('jpg', 'jpeg'):
+                q = max(1, min(100, int(getattr(job, 'quality', 90))))
+                ratio = 0.6 + 1.2 * (q / 100.0)  # 0.6 .. 1.8
             elif fmt == 'webp':
-                q = max(1, min(100, job.quality))
-                ratio = 0.5 + 1.0*(q/100.0)  # 0.5 .. 1.5
-            elif fmt in ('tif','tiff'):
-                c = (job.tiff_compression or 'tiff_deflate')
+                q = max(1, min(100, int(getattr(job, 'quality', 90))))
+                ratio = 0.5 + 1.0 * (q / 100.0)  # 0.5 .. 1.5
+            elif fmt in ('tif', 'tiff'):
+                c = str(getattr(job, 'tiff_compression', 'tiff_deflate'))
                 ratio = 1.4 if c != 'tiff_lzw' else 1.3
+            else:
+                ratio = 1.0
             est = int(size * ratio)
             return self._human_bytes(est)
         except Exception:
@@ -1168,6 +1244,10 @@ class MainWindow(QMainWindow):
         jpeg_q = getattr(self, 'jpeg_quality', None).value() if hasattr(self, 'jpeg_quality') else None
         png_lvl = getattr(self, 'png_level', None).value() if hasattr(self, 'png_level') else None
         other_q = getattr(self, 'other_quality', None).value() if hasattr(self, 'other_quality') else None
+        # 尺寸与比例（用于PNG像素级估算）
+        wv = getattr(self, 'ins_width', None).value() if hasattr(self, 'ins_width') else 0
+        hv = getattr(self, 'ins_height', None).value() if hasattr(self, 'ins_height') else 0
+        keep_aspect = bool(getattr(self, 'btn_lock', None).isChecked()) if hasattr(self, 'btn_lock') else True
         for i, job in enumerate(self.jobs):
             try:
                 it = self.queue.topLevelItem(i)
@@ -1180,6 +1260,8 @@ class MainWindow(QMainWindow):
                     ov = OV()
                     ov.src_bytes = job.src_bytes
                     ov.tiff_compression = getattr(job, 'tiff_compression', 'tiff_deflate')
+                    ov.req_size = (int(wv or 0), int(hv or 0))
+                    ov.keep_aspect = keep_aspect
                     if fmt in ('jpg','jpeg'):
                         ov.export_format = fmt
                         ov.quality = int(jpeg_q or job.quality)
@@ -1187,6 +1269,7 @@ class MainWindow(QMainWindow):
                         ov.export_format = fmt
                         ov.png_compress_level = int(png_lvl if png_lvl is not None else getattr(job, 'png_compress_level', 6))
                         ov.quality = getattr(job, 'quality', 90)
+                        ov.png_optimize = bool(getattr(self, '_adv_png_optimize', False))
                     elif fmt == 'webp':
                         ov.export_format = fmt
                         ov.quality = int(other_q or job.quality)
@@ -1388,6 +1471,10 @@ class MainWindow(QMainWindow):
             return
         # 缓存并按当前列宽等比缩放设置到行标签
         self._thumb_cache[idx] = img
+        try:
+            self._thumb_loading.discard(idx)
+        except Exception:
+            pass
         w = self._thumb_target_width()
         h = max(32, int(round(w * (img.height() / max(1.0, float(img.width()))))))
         pix = QPixmap.fromImage(img.scaled(w, h, Qt.KeepAspectRatio, Qt.SmoothTransformation))
@@ -1405,6 +1492,62 @@ class MainWindow(QMainWindow):
             w = 48
         # 限制列宽范围
         return max(40, min(220, int(w - 6)))
+
+    def _request_thumb_for(self, index: int) -> None:
+        """确保提交指定行的缩略图加载任务（若未缓存且未在加载）。"""
+        try:
+            if index in self._thumb_cache:
+                return
+            if index in self._thumb_loading:
+                return
+            if not (0 <= index < len(self.jobs)):
+                return
+            job = self.jobs[index]
+            src = job.src_path
+            self._thumb_loading.add(index)
+            # 预估缩略图目标尺寸（放大2倍，保证清晰；上限512）
+            req_side = min(512, max(64, self._thumb_target_width() * 2))
+
+            def _load_and_emit(idx=index, s=src, side=req_side, j=job):
+                img: QImage | None = load_thumbnail(s, side)
+                if img is not None:
+                    self.bus.thumb_ready.emit(idx, s, img)
+                # 尺寸异步补充
+                sz = get_image_size(s)
+                if sz is not None:
+                    j.orig_size = sz
+                    try:
+                        self.bus.job_update.emit(idx, j)
+                    except Exception:
+                        pass
+                # 标记结束（无论成功失败）
+                try:
+                    self._thumb_loading.discard(idx)
+                except Exception:
+                    pass
+
+            self._thumb_pool.submit(_load_and_emit)
+        except Exception:
+            pass
+
+    def _ensure_visible_thumbs(self) -> None:
+        """在滚动/重绘时，确保视口内行的缩略图都已请求加载。"""
+        try:
+            vp = self.queue.viewport()
+            h = vp.height()
+            # 以较大步长向下取样行，避免过多计算
+            y = 0
+            seen = set()
+            while y < h:
+                it = self.queue.itemAt(10, y)  # 取第1列区域的一个点
+                if it is not None:
+                    idx = it.data(0, Qt.UserRole)
+                    if idx is not None and idx not in seen:
+                        seen.add(idx)
+                        self._request_thumb_for(int(idx))
+                y += 48
+        except Exception:
+            pass
 
     def _update_all_row_heights(self) -> None:
         w = self._thumb_target_width()
@@ -1741,6 +1884,9 @@ class MainWindow(QMainWindow):
         dlg = FormatSettingsDialog(fmt, self, self)
         if dlg.exec() == QDialog.Accepted:
             dlg.apply_to_main()
+            # 高级参数变更后，刷新预估与时间估算
+            self._refresh_estimates_throttled()
+            self._refresh_time_estimate_throttled()
 
     def _update_thread_controls(self) -> None:
         """根据Auto/手动选择启用/禁用线程数控件。"""
