@@ -1,0 +1,17 @@
+<svg width="128" height="128" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="g" x1="11" y1="10" x2="16" y2="10" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#3B82F6"></stop>
+      <stop offset="1" stop-color="#10B981"></stop>
+    </linearGradient>
+  </defs>
+  <!-- 左侧：字母 H（替换原方框） -->
+  <path d="M4.5 6V14M8.5 6V14M4.5 10H8.5" stroke="#111827" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"></path>
+  <!-- 中间：右向箭头（水平 y=10） -->
+  <path d="M11 10h5" stroke="url(#g)" stroke-width="1.8" stroke-linecap="round"></path>
+  <path d="M16 10l-2-2M16 10l-2 2" stroke="url(#g)" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"></path>
+  <!-- 右侧：三点，中点与箭头 y=10 对齐 -->
+  <circle cx="20" cy="6" r="1.2" fill="#111827"></circle>
+  <circle cx="20" cy="10" r="1.2" fill="#111827"></circle>
+  <circle cx="20" cy="14" r="1.2" fill="#111827"></circle>
+</svg>

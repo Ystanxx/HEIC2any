@@ -19,6 +19,7 @@ QLineEdit, QComboBox, QSpinBox, QToolButton, QPushButton {
     border: 1px solid #D1D5DB;
     background: #ffffff;
 }
+QComboBox { padding-left: 8px; }
 QPushButton:pressed, QToolButton:pressed {
     background: #E5E7EB;
     padding-top: 1px; /* 伪3D 下陷效果 */
@@ -50,11 +51,11 @@ QPushButton#btnStop:hover { background: rgba(220,38,38,0.08); }
 /* 文件列表行高、缩略图尺寸与选中态 */
 QTreeView::item { height: 56px; }
 QTreeWidget { alternate-background-color: #fafafa; }
-QTreeWidget::item:selected { background: #e6f2ff; }
+QTreeWidget::item:selected { background: #e6f2ff; color: #111111; }
 
 /* 进度条细条样式 */
 QProgressBar { height: 6px; border-radius: 3px; background: #E5E7EB; }
 QProgressBar::chunk { background: #22c55e; border-radius: 3px; }
 
 /* 小型步进按钮（尺寸/线程用） */
-QToolButton#stepBtn { min-width: 32px; padding: 2px 6px; border-radius: 6px; }
+QToolButton#stepBtn { min-width: 40px; padding: 2px 6px; border-radius: 6px; }

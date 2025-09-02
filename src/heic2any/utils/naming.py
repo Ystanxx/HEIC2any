@@ -15,7 +15,7 @@ from heic2any.core.state import JobItem
 def render_output_name(template: str, job: JobItem, index: int) -> str:
     """根据模板渲染输出文件名（不含扩展名）。
 
-    支持Token：{name}（原文件名不含扩展）；{index}；{date}；{datetime}；{width}；{height}
+    支持Token：{name}（原文件名不含扩展）；{index}；{date}；{datetime}；{width}/{height}；别名 {w}/{h}；{fmt}（格式）；{q}（质量/等级）
     """
     stem = os.path.splitext(os.path.basename(job.src_path))[0]
     now = datetime.now()
@@ -29,6 +29,10 @@ def render_output_name(template: str, job: JobItem, index: int) -> str:
     name = name.replace("{datetime}", now.strftime("%Y%m%d_%H%M%S"))
     name = name.replace("{width}", str(w))
     name = name.replace("{height}", str(h))
+    name = name.replace("{w}", str(w))
+    name = name.replace("{h}", str(h))
+    name = name.replace("{fmt}", str(job.export_format))
+    name = name.replace("{q}", str(job.quality))
     return name
 
 
@@ -37,4 +41,3 @@ def build_output_path(job: JobItem, index: int) -> str:
     fname = render_output_name(job.template, job, index)
     ext = job.export_format.lower().replace('jpeg', 'jpg')
     return os.path.join(job.export_dir, f"{fname}.{ext}")
-

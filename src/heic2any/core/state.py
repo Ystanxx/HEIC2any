@@ -51,6 +51,7 @@ class JobItem:
 
     # 元数据（尺寸）
     orig_size: Tuple[int, int] = (0, 0)
+    src_bytes: int = 0
 
     # 高级参数（按格式生效）
     # JPEG
@@ -68,7 +69,11 @@ class JobItem:
     def from_source(path: str) -> "JobItem":
         # 初始导出目录设为当前工作目录下的 output
         out = os.path.join(os.getcwd(), 'output')
-        return JobItem(src_path=path, export_dir=out)
+        try:
+            size_b = os.path.getsize(path)
+        except Exception:
+            size_b = 0
+        return JobItem(src_path=path, export_dir=out, src_bytes=size_b)
 
     def size_text(self) -> str:
         w, h = self.orig_size
@@ -115,6 +120,10 @@ class AppSettings:
     last_input_dir: str = ""
     # 新增：重名文件处理策略："ask"/"replace"/"skip"
     collision_policy: str = "ask"
+    # 列显示/计算开关（输入文件信息）
+    show_col_dims: bool = True
+    show_col_size: bool = True
+    show_col_estimate: bool = True
 
     @staticmethod
     def load() -> "AppSettings":

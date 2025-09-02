@@ -56,11 +56,11 @@ def run_app() -> int:
     _tune_palette(app)
     _load_qss(app)
 
-    # 应用图标：优先仓库根目录下的 logo.jpg，其次 resources/app.png；都不存在则使用系统标准图标
+    # 应用图标：优先仓库根目录下的 logo.svg，其次 resources/app.png；都不存在则使用系统标准图标
     try:
         src_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # 指向 src 目录
         repo_root = os.path.dirname(src_dir)
-        logo_root = os.path.join(repo_root, 'logo.jpg')
+        logo_root = os.path.join(repo_root, 'logo.svg')
         icon_path_res = os.path.join(src_dir, 'heic2any', 'resources', 'app.png')
         if os.path.exists(logo_root):
             icon_obj = QIcon(logo_root)

@@ -14,8 +14,8 @@ import threading
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
-from PySide6.QtCore import Qt, QSize, Signal, QObject
-from PySide6.QtGui import QAction, QIcon, QPixmap, QImage
+from PySide6.QtCore import Qt, QSize, Signal, QObject, QEvent
+from PySide6.QtGui import QAction, QIcon, QPixmap, QImage, QCursor
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QSplitter, QTreeWidget, QTreeWidgetItem, QFileDialog, QMenu, QToolButton,
@@ -27,7 +27,7 @@ from PySide6.QtWidgets import QAbstractSpinBox
 
 from heic2any.core.state import JobItem, JobStatus, ExportFormat, AppSettings
 from heic2any.core.tasks import TaskManager
-from heic2any.utils.images import make_placeholder_thumbnail, load_thumbnail
+from heic2any.utils.images import make_placeholder_thumbnail, load_thumbnail, get_image_size
 from heic2any.utils.naming import render_output_name, build_output_path
 from heic2any.utils.conda import CondaEnv, find_conda_envs, test_env_dependencies
 
@@ -92,6 +92,19 @@ class AppSettingsDialog(QDialog):
         fl2.addRow(self.radio_exit)
         fl2.addRow(self.radio_min)
 
+        # 输入文件信息选择
+        grp_info = QGroupBox("输入文件信息")
+        fl_info = QFormLayout(grp_info)
+        self.chk_show_dims = QCheckBox("显示尺寸")
+        self.chk_show_size = QCheckBox("显示文件大小")
+        self.chk_show_est = QCheckBox("显示预估大小")
+        self.chk_show_dims.setChecked(bool(getattr(settings, 'show_col_dims', True)))
+        self.chk_show_size.setChecked(bool(getattr(settings, 'show_col_size', True)))
+        self.chk_show_est.setChecked(bool(getattr(settings, 'show_col_estimate', True)))
+        fl_info.addRow(self.chk_show_dims)
+        fl_info.addRow(self.chk_show_size)
+        fl_info.addRow(self.chk_show_est)
+
         # 重名处理
         grp_dup = QGroupBox("重名文件处理")
         fl3 = QFormLayout(grp_dup)
@@ -113,15 +126,25 @@ class AppSettingsDialog(QDialog):
         btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         btns.accepted.connect(self.accept)
         btns.rejected.connect(self.reject)
+        # 统一OK/Cancel按钮宽度
+        try:
+            okb = btns.button(QDialogButtonBox.Ok)
+            cb = btns.button(QDialogButtonBox.Cancel)
+            for b in (okb, cb):
+                if b is not None:
+                    b.setMinimumWidth(96)
+        except Exception:
+            pass
 
         lay.addWidget(grp_notify)
         lay.addWidget(grp_close)
+        lay.addWidget(grp_info)
         lay.addWidget(grp_dup)
         lay.addStretch(1)
         lay.addWidget(btns)
 
-    def values(self) -> tuple[bool, str, str]:
-        """返回(启用通知, 关闭行为, 重名策略)。"""
+    def values(self) -> tuple[bool, str, str, dict]:
+        """返回(启用通知, 关闭行为, 重名策略, 列显示设置)。"""
         enable = self.chk_notify.isChecked()
         action = 'minimize' if self.radio_min.isChecked() else 'exit'
         if self.radio_dup_replace.isChecked():
@@ -130,7 +153,12 @@ class AppSettingsDialog(QDialog):
             dup = 'skip'
         else:
             dup = 'ask'
-        return enable, action, dup
+        cols = {
+            'show_col_dims': self.chk_show_dims.isChecked(),
+            'show_col_size': self.chk_show_size.isChecked(),
+            'show_col_estimate': self.chk_show_est.isChecked(),
+        }
+        return enable, action, dup, cols
 
 
 class FormatSettingsDialog(QDialog):
@@ -186,6 +214,14 @@ class FormatSettingsDialog(QDialog):
         btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         btns.accepted.connect(self.accept)
         btns.rejected.connect(self.reject)
+        try:
+            okb = btns.button(QDialogButtonBox.Ok)
+            cb = btns.button(QDialogButtonBox.Cancel)
+            for b in (okb, cb):
+                if b is not None:
+                    b.setMinimumWidth(96)
+        except Exception:
+            pass
         lay.addStretch(1)
         lay.addWidget(btns)
 
@@ -268,7 +304,11 @@ class MainWindow(QMainWindow):
         splitter.setHandleWidth(6)
         splitter.setStretchFactor(0, 3)
         splitter.setStretchFactor(1, 1)
-        splitter.setSizes([900, 300])
+        # 右栏达到最小宽度前不再压缩，左栏最小宽度与右栏一致作为压缩下限
+        right_min = 480
+        left.setMinimumWidth(right_min)
+        right.setMinimumWidth(right_min)
+        splitter.setSizes([900, right_min])
         root_layout.addWidget(splitter)
 
         # 底部状态栏
@@ -299,6 +339,8 @@ class MainWindow(QMainWindow):
         self._start_button_state = "start"  # start|pause|resume
         self._really_quit = False
         self._notified_all_done = False
+        # 缩略图缓存
+        self._thumb_cache: dict[int, QImage] = {}
 
         # 高级设置缓存（从AppSettings装载）
         self._adv_jpeg_progressive = bool(getattr(self.settings, 'default_jpeg_progressive', False))
@@ -337,52 +379,15 @@ class MainWindow(QMainWindow):
 
     # ---------- 顶部工具栏 ----------
     def _build_topbar(self) -> QWidget:
+        """精简顶部，仅保留产品名；开始/停止按钮下移到左侧列表头部。"""
         w = QWidget()
         lay = QHBoxLayout(w)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(8)
-
         title = QLabel("HEIC2any")
         title.setStyleSheet("font-size: 18px; font-weight: 600;")
-
-        btn_start = QPushButton("开始")
-        btn_start.setObjectName("btnStart")
-        btn_stop = QPushButton("停止")
-        btn_stop.setObjectName("btnStop")
-        btn_start.setIcon(self.style().standardIcon(QStyle.SP_MediaPlay))
-        btn_stop.setIcon(self.style().standardIcon(QStyle.SP_BrowserStop))
-        btn_start.clicked.connect(self._on_click_start_pause_resume)
-        btn_stop.clicked.connect(self._on_click_stop)
-        self._btn_start = btn_start
-        self._btn_stop = btn_stop
-
-        # 右侧更多菜单
-        more_btn = QToolButton()
-        more_btn.setText("更多…")
-        more_btn.setPopupMode(QToolButton.InstantPopup)
-        menu = QMenu()
-
-        act_clear = QAction("清空队列", self)
-        act_clear.triggered.connect(self._action_clear_queue)
-        act_reset = QAction("恢复默认", self)
-        act_reset.triggered.connect(self._action_reset_defaults)
-        act_choose_env = QAction("选择环境", self)
-        act_choose_env.triggered.connect(self._action_choose_env)
-        act_prefs = QAction("偏好设置", self)
-        act_prefs.triggered.connect(self._action_open_prefs)
-        menu.addAction(act_clear)
-        menu.addAction(act_reset)
-        menu.addSeparator()
-        menu.addAction(act_choose_env)
-        menu.addAction(act_prefs)
-
-        more_btn.setMenu(menu)
-
         lay.addWidget(title, 0, Qt.AlignLeft)
-        lay.addWidget(btn_start, 0, Qt.AlignLeft)
-        lay.addWidget(btn_stop, 0, Qt.AlignLeft)
         lay.addStretch(1)
-        lay.addWidget(more_btn, 0, Qt.AlignRight)
         return w
 
     def _refresh_topbar_states(self) -> None:
@@ -406,8 +411,13 @@ class MainWindow(QMainWindow):
 
     def _on_click_start_pause_resume(self) -> None:
         if self._start_button_state == "start":
-            # 解析并发设置（Auto/自定义）
-            if hasattr(self, 'ins_threads_mode') and self.ins_threads_mode.currentText() == 'Auto':
+            # 空队列防护：无文件或无待处理项时提示且不改变按钮状态
+            pending = [j for j in self.jobs if j.status in (JobStatus.WAITING, JobStatus.PAUSED)]
+            if len(pending) == 0:
+                self._show_info("队列为空，请先添加文件")
+                return
+            # 解析并发设置（Auto/手动）
+            if hasattr(self, 'rb_auto') and self.rb_auto.isChecked():
                 self.ins_threads.setValue(self._auto_threads)
             # 在开始前，将当前检查器参数应用到所有未完成任务，避免仅更改下拉未点击“应用到选中”导致始终导出JPG
             self._apply_current_settings_to_pending_jobs()
@@ -437,10 +447,7 @@ class MainWindow(QMainWindow):
         self.queue.clear()
         self._update_total_progress()
         self._notified_all_done = False
-        try:
-            self._empty.setVisible(True)
-        except Exception:
-            pass
+        self._update_empty_placeholder()
 
     def _action_reset_defaults(self) -> None:
         self.settings = AppSettings()  # 恢复默认
@@ -459,21 +466,21 @@ class MainWindow(QMainWindow):
     def _action_open_prefs(self) -> None:
         # 轻量化：直接基于当前 inspector 的设置保存为默认
         self._apply_inspector_to_defaults()
-        QMessageBox.information(self, "提示", "已将当前检查器作为偏好设置保存")
+        self._show_info("已将当前检查器作为偏好设置保存")
 
     def _action_choose_env(self) -> None:
         dlg = EnvSelectDialog(self)
         if dlg.exec() == QDialog.Accepted:
             env = dlg.selected_env()
             if env is None:
-                QMessageBox.information(self, "环境", "未选择环境")
+                self._show_info("未选择环境","环境")
                 return
             okdep, msg = test_env_dependencies(env)
             # 保存到设置
             self.settings.selected_env_prefix = env.prefix
             AppSettings.save(self.settings)
             tip = f"已选择环境：{env.name}\n路径：{env.prefix}\n依赖检测：{msg}"
-            QMessageBox.information(self, "环境", tip)
+            self._show_info(tip,"环境")
 
     # ---------- 左侧文件队列 ----------
     def _build_queue(self) -> QWidget:
@@ -484,46 +491,79 @@ class MainWindow(QMainWindow):
 
         header = QHBoxLayout()
         header.setSpacing(8)
-        # 紧凑按钮组（有边框）
-        btn_add_files = QToolButton(); btn_add_files.setText("添加文件"); btn_add_files.setToolButtonStyle(Qt.ToolButtonTextOnly); btn_add_files.setAutoRaise(False)
-        btn_add_dir = QToolButton(); btn_add_dir.setText("添加文件夹"); btn_add_dir.setToolButtonStyle(Qt.ToolButtonTextOnly); btn_add_dir.setAutoRaise(False)
-        btn_choose_out = QToolButton(); btn_choose_out.setText("选择输出目录"); btn_choose_out.setToolButtonStyle(Qt.ToolButtonTextOnly); btn_choose_out.setAutoRaise(False)
-        btn_settings = QToolButton(); btn_settings.setText("设置"); btn_settings.setToolButtonStyle(Qt.ToolButtonTextOnly); btn_settings.setAutoRaise(False)
-        btn_add_files.clicked.connect(self._add_files)
-        btn_add_dir.clicked.connect(self._add_dir)
+        # 开始/停止按钮下移到此处
+        btn_start = QPushButton("开始"); btn_start.setObjectName("btnStart"); btn_start.setFixedHeight(48); btn_start.setMinimumWidth(120)
+        btn_stop = QPushButton("停止"); btn_stop.setObjectName("btnStop"); btn_stop.setFixedHeight(48); btn_stop.setMinimumWidth(120)
+        btn_start.setIcon(self.style().standardIcon(QStyle.SP_MediaPlay))
+        btn_stop.setIcon(self.style().standardIcon(QStyle.SP_BrowserStop))
+        btn_start.clicked.connect(self._on_click_start_pause_resume)
+        btn_stop.clicked.connect(self._on_click_stop)
+        self._btn_start = btn_start
+        self._btn_stop = btn_stop
+
+        btn_choose_out = QToolButton(); btn_choose_out.setText("选择输出目录"); btn_choose_out.setToolButtonStyle(Qt.ToolButtonTextOnly); btn_choose_out.setAutoRaise(False); btn_choose_out.setFixedHeight(32)
+        btn_settings = QToolButton(); btn_settings.setText("设置"); btn_settings.setToolButtonStyle(Qt.ToolButtonTextOnly); btn_settings.setAutoRaise(False); btn_settings.setFixedHeight(32)
         btn_choose_out.clicked.connect(self._choose_output_dir)
         btn_settings.clicked.connect(self._open_settings)
-        header.addWidget(btn_add_files)
-        header.addWidget(btn_add_dir)
+
+        header.addWidget(btn_start)
+        header.addWidget(btn_stop)
         header.addStretch(1)
         header.addWidget(btn_choose_out)
         header.addWidget(btn_settings)
 
         self.queue = QTreeWidget()
-        self.queue.setColumnCount(6)
-        self.queue.setHeaderLabels(["缩略图", "名称", "尺寸", "状态", "进度", "错误"])
+        self.queue.setColumnCount(8)
+        self.queue.setHeaderLabels(["缩略图", "名称", "尺寸", "大小", "预估", "状态", "进度", "错误"])
         self.queue.setRootIsDecorated(False)
         self.queue.setAlternatingRowColors(True)
         self.queue.setSelectionMode(QTreeWidget.ExtendedSelection)
         self.queue.setIconSize(QSize(48, 48))
         self.queue.setAcceptDrops(True)
         self.queue.dragEnterEvent = self._drag_enter
+        self.queue.dragMoveEvent = self._drag_move
         self.queue.dropEvent = self._drop
         self.queue.itemSelectionChanged.connect(self._on_selection_changed)
-        # 空状态占位
-        self._empty = QLabel("拖拽或点击添加文件")
+        try:
+            self.queue.header().sectionResized.connect(self._on_queue_section_resized)
+            self._update_row_height_for_thumb()
+        except Exception:
+            pass
+        # 空状态提示覆盖到列表内部，允许拖拽到列表
+        self._empty = QLabel("拖拽或点击添加文件", self.queue.viewport())
         self._empty.setAlignment(Qt.AlignCenter)
         self._empty.setStyleSheet("color:#9CA3AF; font-size:14px;")
+        self._empty.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self._empty.show()
+        # 设置初始几何并跟随列表 viewport 尺寸
+        try:
+            self._empty.setGeometry(self.queue.viewport().rect())
+        except Exception:
+            pass
+        _orig_resize = self.queue.resizeEvent
+        def _resize(ev):
+            try:
+                self._empty.setGeometry(self.queue.viewport().rect())
+            except Exception:
+                pass
+            _orig_resize(ev)
+        self.queue.resizeEvent = _resize  # type: ignore
 
-        wrap = QWidget(); v = QVBoxLayout(wrap); v.setContentsMargins(0,0,0,0); v.setSpacing(0)
-        v.addWidget(self._empty, 1)
-        v.addWidget(self.queue, 1)
+        # 允许点击列表空白区域弹出选择菜单（添加文件/文件夹）
+        self.queue.viewport().installEventFilter(self)
 
         lay.addLayout(header)
-        lay.addWidget(wrap, 1)
+        lay.addWidget(self.queue, 1)
+        self._update_empty_placeholder()
         return w
 
     def _drag_enter(self, e):  # type: ignore
+        if e.mimeData().hasUrls():
+            e.acceptProposedAction()
+        else:
+            e.ignore()
+
+    def _drag_move(self, e):  # type: ignore
         if e.mimeData().hasUrls():
             e.acceptProposedAction()
         else:
@@ -553,6 +593,80 @@ class MainWindow(QMainWindow):
         self._selected_indices = sorted(indices)
         self._load_selected_to_inspector()
 
+    def eventFilter(self, obj, event):  # type: ignore
+        # 点击左侧空白区域：左键→直接选择文件；右键→弹出菜单（文件/文件夹）
+        try:
+            if obj is self.queue.viewport() and event.type() == QEvent.MouseButtonRelease and event.buttons() == Qt.NoButton:
+                pos = event.pos()
+                # 若点击位置没有条目，则展示菜单
+                if self.queue.itemAt(pos) is None:
+                    if event.button() == Qt.RightButton:
+                        menu = QMenu(self)
+                        act_files = QAction("添加文件", self)
+                        act_files.triggered.connect(self._add_files)
+                        act_dir = QAction("添加文件夹", self)
+                        act_dir.triggered.connect(self._add_dir)
+                        menu.addAction(act_files)
+                        menu.addAction(act_dir)
+                        gp = self.queue.viewport().mapToGlobal(pos)
+                        menu.exec(gp)
+                    else:
+                        self._add_files()
+                    return True
+        except Exception:
+            pass
+        return super().eventFilter(obj, event)
+
+    def _update_empty_placeholder(self) -> None:
+        """根据队列是否为空显示/隐藏内置提示。"""
+        try:
+            if hasattr(self, 'queue') and hasattr(self, '_empty'):
+                self._empty.setGeometry(self.queue.viewport().rect())
+                self._empty.setVisible(self.queue.topLevelItemCount() == 0)
+        except Exception:
+            pass
+
+    def _apply_column_visibility(self) -> None:
+        """根据设置隐藏或显示输入信息列，避免不必要的计算。"""
+        try:
+            # 列索引：2=尺寸, 3=大小, 4=预估
+            self.queue.setColumnHidden(2, not getattr(self.settings, 'show_col_dims', True))
+            self.queue.setColumnHidden(3, not getattr(self.settings, 'show_col_size', True))
+            self.queue.setColumnHidden(4, not getattr(self.settings, 'show_col_estimate', True))
+        except Exception:
+            pass
+
+    # ---------- 统一弹窗 ----------
+    def _show_info(self, text: str, title: str = "提示") -> None:
+        try:
+            m = QMessageBox(self)
+            m.setIcon(QMessageBox.Information)
+            m.setWindowTitle(title)
+            m.setText(text)
+            m.setMinimumWidth(420)
+            m.setStandardButtons(QMessageBox.Ok)
+            okb = m.button(QMessageBox.Ok)
+            if okb:
+                okb.setMinimumWidth(96)
+            m.exec()
+        except Exception:
+            QMessageBox.information(self, title, text)
+
+    def _show_warning(self, text: str, title: str = "提示") -> None:
+        try:
+            m = QMessageBox(self)
+            m.setIcon(QMessageBox.Warning)
+            m.setWindowTitle(title)
+            m.setText(text)
+            m.setMinimumWidth(420)
+            m.setStandardButtons(QMessageBox.Ok)
+            okb = m.button(QMessageBox.Ok)
+            if okb:
+                okb.setMinimumWidth(96)
+            m.exec()
+        except Exception:
+            QMessageBox.warning(self, title, text)
+
     def _choose_output_dir(self) -> None:
         d = QFileDialog.getExistingDirectory(self, "选择输出目录", self.output_dir)
         if d:
@@ -571,7 +685,7 @@ class MainWindow(QMainWindow):
                 j.export_dir = self.output_dir
                 changed += 1
         if changed:
-            QMessageBox.information(self, "输出目录", f"已将输出目录应用到{changed}个未完成任务")
+            self._show_info(f"已将输出目录应用到{changed}个未完成任务","输出目录")
 
     def _add_files(self) -> None:
         start_dir = self._ensure_valid_input_dir()
@@ -626,29 +740,23 @@ class MainWindow(QMainWindow):
                 elif fmt in ('tif','tiff'):
                     item.tiff_compression = self._adv_tiff_compression
             # 尺寸与比例
-            wv, hv, lv = self.ins_width.value(), self.ins_height.value(), self.ins_longest.value()
-            if lv > 0 and wv == 0 and hv == 0:
-                item.req_size = (lv, 0)
-            else:
-                item.req_size = (wv, hv)
+            wv, hv = self.ins_width.value(), self.ins_height.value()
+            item.req_size = (wv, hv)
             item.keep_aspect = bool(self.btn_lock.isChecked())
             self.jobs.append(item)
             row = self._create_row(item, len(self.jobs)-1)
             self.queue.addTopLevelItem(row)
             added += 1
         if added > 0:
-            try:
-                self._empty.setVisible(False)
-            except Exception:
-                pass
+            self._update_empty_placeholder()
         if added == 0:
-            QMessageBox.information(self, "提示", "未添加任何HEIC文件")
+            self._show_info("未添加任何HEIC文件")
         self._update_total_progress()
 
     def _create_row(self, job: JobItem, index: int) -> QTreeWidgetItem:
-        it = QTreeWidgetItem(["", os.path.basename(job.src_path), job.size_text(), job.status_text(), "0%", ""]) 
+        it = QTreeWidgetItem(["", os.path.basename(job.src_path), job.size_text(), self._human_bytes(job.src_bytes), self._estimate_output_text(job), job.status_text(), "0%", ""]) 
         it.setData(0, Qt.UserRole, index)
-        it.setTextAlignment(4, Qt.AlignRight | Qt.AlignVCenter)
+        it.setTextAlignment(6, Qt.AlignHCenter | Qt.AlignVCenter)
         # 缩略图
         # 先放占位，避免阻塞UI
         placeholder = make_placeholder_thumbnail()
@@ -661,6 +769,14 @@ class MainWindow(QMainWindow):
             if img is not None:
                 # 通过Qt信号回到UI线程
                 self.bus.thumb_ready.emit(idx, src, img)
+            # 异步读取尺寸（轻量元数据），回到UI线程更新
+            sz = get_image_size(src)
+            if sz is not None:
+                job.orig_size = sz
+                try:
+                    self.bus.job_update.emit(idx, job)
+                except Exception:
+                    pass
         self._thumb_pool.submit(_load_and_emit)
         return it
 
@@ -671,10 +787,10 @@ class MainWindow(QMainWindow):
         lay.setContentsMargins(16, 16, 16, 16)
         lay.setSpacing(16)
         # 限位：防止右栏被压缩到按钮与文本不可读
-        w.setMinimumWidth(460)
+        w.setMinimumWidth(480)
 
         # 导出设置卡片
-        export_card, export_form = self._make_card('导出设置', link_text='更多设置…', link_cb=self._open_format_settings_dialog)
+        export_card, export_form = self._make_card('导出设置', link_text='更多设置', link_cb=self._open_format_settings_dialog)
         self.ins_format = QComboBox()
         for fmt in ExportFormat.list_display():
             self.ins_format.addItem(fmt)
@@ -720,17 +836,26 @@ class MainWindow(QMainWindow):
 
         # 尺寸卡片
         size_card, size_form = self._make_card('尺寸')
+        # 提示语（相对像素）
+        self._hint_rel = QLabel('提示：按钮为相对像素调整')
+        self._hint_rel.setStyleSheet('color:#9CA3AF;')
+        size_form.addRow('', self._hint_rel)
         self.ins_width = QSpinBox(); self.ins_width.setMaximum(20000); self.ins_width.setMinimum(0); self.ins_width.setSpecialValueText('留空＝保持原尺寸'); self.ins_width.setSuffix(' px'); self.ins_width.setButtonSymbols(QAbstractSpinBox.NoButtons)
         self.ins_height = QSpinBox(); self.ins_height.setMaximum(20000); self.ins_height.setMinimum(0); self.ins_height.setSpecialValueText('留空＝保持原尺寸'); self.ins_height.setSuffix(' px'); self.ins_height.setButtonSymbols(QAbstractSpinBox.NoButtons)
         self._keep_aspect = True
         self.btn_lock = QToolButton(); self.btn_lock.setCheckable(True); self.btn_lock.setChecked(True); self.btn_lock.setText('🔒')
+        self._height_step_buttons: list[QToolButton] = []
         def _on_lock_toggled(b: bool):
             self._keep_aspect = bool(b)
             self.btn_lock.setText('🔒' if b else '🔓')
+            # 锁定时禁用“高”输入与其步进按钮
+            self.ins_height.setEnabled(not b)
+            for bt in self._height_step_buttons:
+                bt.setEnabled(not b)
         self.btn_lock.toggled.connect(_on_lock_toggled)
         # 使用网格布局：锁在左侧垂直占两行；宽在上，高在下
         grid = QGridLayout(); grid.setContentsMargins(0,0,0,0); grid.setHorizontalSpacing(8); grid.setVerticalSpacing(8)
-        grid.addWidget(self.btn_lock, 0, 0, 2, 1, alignment=Qt.AlignLeft | Qt.AlignTop)
+        grid.addWidget(self.btn_lock, 0, 0, 2, 1, alignment=Qt.AlignLeft | Qt.AlignVCenter)
         # 宽行
         grid.addWidget(QLabel('宽'), 0, 1)
         grid.addWidget(self.ins_width, 0, 2)
@@ -749,46 +874,58 @@ class MainWindow(QMainWindow):
             b = QToolButton(); b.setObjectName('stepBtn'); b.setText(t); b.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
             b.clicked.connect(lambda _, d=dv, sp=self.ins_height: sp.setValue(max(sp.minimum(), min(sp.maximum(), sp.value()+d))))
             grid.addWidget(b, 1, col)
+            self._height_step_buttons.append(b)
             col += 1
         row_wh = QWidget(); row_wh.setLayout(grid)
         size_form.addRow('', row_wh)
-        self.ins_longest = QSpinBox(); self.ins_longest.setMaximum(20000); self.ins_longest.setMinimum(0); self.ins_longest.setSpecialValueText('留空＝不限制'); self.ins_longest.setSuffix(' px'); self.ins_longest.setButtonSymbols(QAbstractSpinBox.NoButtons)
-        row_l = QWidget(); rl = QHBoxLayout(row_l); rl.setContentsMargins(0,0,0,0); rl.setSpacing(8)
-        rl.addWidget(self.ins_longest, 1)
-        for t, dv in (("-10", -10), ("-1", -1), ("+1", 1), ("+10", 10)):
-            b = QToolButton(); b.setObjectName('stepBtn'); b.setText(t); b.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed); b.clicked.connect(lambda _, d=dv, sp=self.ins_longest: sp.setValue(max(sp.minimum(), min(sp.maximum(), sp.value()+d))))
-            rl.addWidget(b)
-        size_form.addRow('最长边', row_l)
+        # 删除“最长边”设置，保持界面简洁
 
         # 输出命名卡片
         name_card, name_form = self._make_card('输出命名')
         self.ins_template = QLineEdit('{name}_{index}')
-        self.ins_token = QComboBox(); self.ins_token.addItems(['{name}','{index}','{date}','{datetime}','{width}','{height}'])
+        self.ins_token = QComboBox(); self.ins_token.addItems(['{name}','{index}','{date}','{datetime}','{width}','{height}','{w}','{h}','{fmt}','{q}'])
         btn_insert = QPushButton('插入Token'); btn_insert.clicked.connect(lambda: self.ins_template.insert(self.ins_token.currentText()))
-        rowt = QWidget(); rt = QHBoxLayout(rowt); rt.setContentsMargins(0,0,0,0)
-        rt.addWidget(self.ins_template, 1); rt.addWidget(self.ins_token); rt.addWidget(btn_insert)
-        self.ins_preview = QLabel(''); self.ins_preview.setStyleSheet('color:#6B7280;')
+        rowt = QWidget(); rt = QHBoxLayout(rowt); rt.setContentsMargins(0,0,0,0); rt.setSpacing(8)
+        rt.addWidget(self.ins_template, 1)
+        rt.addWidget(btn_insert)
+        rt.addWidget(self.ins_token)
+        self.ins_preview = QLabel('(未选择项目)'); self.ins_preview.setStyleSheet('color:#6B7280;')
+        # 复制按钮
+        btn_copy = QToolButton(); btn_copy.setText('复制'); btn_copy.setObjectName('stepBtn')
+        def _copy_preview():
+            from PySide6.QtWidgets import QApplication as QApp
+            QApp.clipboard().setText(self.ins_preview.text())
+        btn_copy.clicked.connect(_copy_preview)
         name_form.addRow('模板', rowt)
-        name_form.addRow('预览', self.ins_preview)
+        prev_row = QWidget(); prl = QHBoxLayout(prev_row); prl.setContentsMargins(0,0,0,0); prl.setSpacing(8)
+        prl.addWidget(self.ins_preview, 1)
+        prl.addWidget(btn_copy)
+        name_form.addRow('预览', prev_row)
 
         # 并发与应用卡片
         misc_card, misc_form = self._make_card('并发与应用')
         from os import cpu_count
         self._auto_threads = max(1, min(8, (cpu_count() or 4)))
-        self.ins_threads_mode = QComboBox(); self.ins_threads_mode.addItems(['Auto','自定义'])
-        self.ins_threads = QSpinBox(); self.ins_threads.setRange(1, 64); self.ins_threads.setValue(self.settings.default_threads)
-        self.lbl_threads_res = QLabel(f'= {self._auto_threads} 线程')
-        self.ins_threads_mode.currentIndexChanged.connect(lambda _: self._update_thread_controls())
+        self.rb_auto = QRadioButton(f"Auto（当前={self._auto_threads} 线程）")
+        self.rb_manual = QRadioButton("手动")
+        self.rb_auto.setChecked(True)
+        self.ins_threads = QSpinBox(); self.ins_threads.setRange(1, 64); self.ins_threads.setValue(self.settings.default_threads); self.ins_threads.setEnabled(False); self.ins_threads.setButtonSymbols(QAbstractSpinBox.NoButtons)
+        # 简洁的 - / + 步进
+        self.btn_thr_minus = QToolButton(); self.btn_thr_minus.setObjectName('stepBtn'); self.btn_thr_minus.setText('-'); self.btn_thr_minus.setEnabled(False)
+        self.btn_thr_plus = QToolButton(); self.btn_thr_plus.setObjectName('stepBtn'); self.btn_thr_plus.setText('+'); self.btn_thr_plus.setEnabled(False)
+        self.btn_thr_minus.clicked.connect(lambda: self.ins_threads.setValue(max(self.ins_threads.minimum(), self.ins_threads.value()-1)))
+        self.btn_thr_plus.clicked.connect(lambda: self.ins_threads.setValue(min(self.ins_threads.maximum(), self.ins_threads.value()+1)))
+        # 行排布
         thr_row = QWidget(); trl = QHBoxLayout(thr_row); trl.setContentsMargins(0,0,0,0); trl.setSpacing(8)
-        trl.addWidget(self.ins_threads_mode)
+        trl.addWidget(self.rb_auto)
+        trl.addWidget(self.rb_manual)
+        trl.addWidget(self.btn_thr_minus)
         trl.addWidget(self.ins_threads)
-        # 线程步进按钮组
-        for t, dv in (("-10", -10), ("-1", -1), ("+1", 1), ("+10", 10)):
-            b = QToolButton(); b.setObjectName('stepBtn'); b.setText(t); b.clicked.connect(lambda _, d=dv: self.ins_threads.setValue(max(self.ins_threads.minimum(), min(self.ins_threads.maximum(), self.ins_threads.value()+d))))
-            trl.addWidget(b)
-        trl.addWidget(self.lbl_threads_res)
+        trl.addWidget(self.btn_thr_plus)
         trl.addStretch(1)
         misc_form.addRow('并发', thr_row)
+        self.rb_auto.toggled.connect(lambda _: self._update_thread_controls())
+        self.rb_manual.toggled.connect(lambda _: self._update_thread_controls())
         btn_apply_sel = QPushButton('应用到选中'); btn_apply_sel.clicked.connect(self._apply_to_selected)
         btn_reset = QPushButton('恢复默认'); btn_reset.clicked.connect(self._action_reset_defaults)
         misc_form.addRow('', btn_apply_sel)
@@ -802,6 +939,21 @@ class MainWindow(QMainWindow):
         self._load_settings_into_inspector()
         self.ins_format.currentTextChanged.connect(self._on_format_changed)
         self._on_format_changed(self.ins_format.currentText())
+        # 预览实时更新
+        try:
+            self.ins_template.textChanged.connect(lambda _: self._refresh_inspector_preview())
+            self.jpeg_quality.valueChanged.connect(lambda _: self._refresh_inspector_preview())
+            self.png_level.valueChanged.connect(lambda _: self._refresh_inspector_preview())
+            self.other_quality.valueChanged.connect(lambda _: self._refresh_inspector_preview())
+            self.ins_width.valueChanged.connect(lambda _: self._refresh_inspector_preview())
+            self.ins_height.valueChanged.connect(lambda _: self._refresh_inspector_preview())
+            # 估算实时更新（轻量，基于文件大小与格式参数）
+            self.ins_format.currentTextChanged.connect(lambda _: self._refresh_estimates_throttled())
+            self.jpeg_quality.valueChanged.connect(lambda _: self._refresh_estimates_throttled())
+            self.png_level.valueChanged.connect(lambda _: self._refresh_estimates_throttled())
+            self.other_quality.valueChanged.connect(lambda _: self._refresh_estimates_throttled())
+        except Exception:
+            pass
         self._update_thread_controls()
         return w
 
@@ -822,6 +974,11 @@ class MainWindow(QMainWindow):
         self.ins_height.setValue(self.settings.default_size[1])
         if hasattr(self, 'btn_lock'):
             self.btn_lock.setChecked(self.settings.default_keep_aspect)
+            # 触发一次以同步禁用状态
+            try:
+                self.btn_lock.toggled.emit(self.btn_lock.isChecked())
+            except Exception:
+                pass
         self.ins_threads.setValue(self.settings.default_threads)
         self.ins_template.setText(self.settings.default_template)
 
@@ -849,6 +1006,95 @@ class MainWindow(QMainWindow):
         # 读取选中项，展示命名预览
         self._refresh_inspector_preview()
 
+    def _human_bytes(self, n: int) -> str:
+        """将字节数格式化为可读字符串。"""
+        try:
+            n = int(n)
+        except Exception:
+            return "-"
+        units = ['B','KB','MB','GB','TB']
+        x = float(n)
+        for u in units:
+            if x < 1024 or u == units[-1]:
+                return f"{x:.1f}{u}" if u != 'B' else f"{int(x)}B"
+            x /= 1024.0
+
+    def _estimate_output_text(self, job: JobItem) -> str:
+        """基于源文件大小与当前导出设置的粗略估算，不解码图片，避免卡顿。"""
+        if not getattr(job, 'src_bytes', 0):
+            return "-"
+        fmt = (job.export_format or '').lower()
+        size = job.src_bytes
+        ratio = 1.0
+        try:
+            if fmt in ('jpg','jpeg'):
+                q = max(1, min(100, job.quality))
+                ratio = 0.6 + 1.2*(q/100.0)  # 0.6 .. 1.8
+            elif fmt == 'png':
+                lvl = getattr(job, 'png_compress_level', 6)
+                ratio = 1.6 - 0.1*max(0, min(9, int(lvl)))  # ~1.6 .. 0.7
+            elif fmt == 'webp':
+                q = max(1, min(100, job.quality))
+                ratio = 0.5 + 1.0*(q/100.0)  # 0.5 .. 1.5
+            elif fmt in ('tif','tiff'):
+                c = (job.tiff_compression or 'tiff_deflate')
+                ratio = 1.4 if c != 'tiff_lzw' else 1.3
+            est = int(size * ratio)
+            return self._human_bytes(est)
+        except Exception:
+            return "-"
+
+    def _refresh_estimates(self) -> None:
+        # 若设置中关闭预估显示，则不计算
+        if not getattr(self.settings, 'show_col_estimate', True):
+            return
+        # 当前检查器设置作为覆盖（仅对待处理项生效）
+        fmt = (self.ins_format.currentText() or '').lower() if hasattr(self, 'ins_format') else ''
+        # 质量/等级
+        jpeg_q = getattr(self, 'jpeg_quality', None).value() if hasattr(self, 'jpeg_quality') else None
+        png_lvl = getattr(self, 'png_level', None).value() if hasattr(self, 'png_level') else None
+        other_q = getattr(self, 'other_quality', None).value() if hasattr(self, 'other_quality') else None
+        for i, job in enumerate(self.jobs):
+            try:
+                it = self.queue.topLevelItem(i)
+                if not it:
+                    continue
+                # 构造一个轻量覆盖副本，仅覆盖导出参数，不修改原job，避免提前写入
+                class OV: pass
+                o = job
+                if job.status in (JobStatus.WAITING, JobStatus.PAUSED) and fmt:
+                    ov = OV()
+                    ov.src_bytes = job.src_bytes
+                    ov.tiff_compression = getattr(job, 'tiff_compression', 'tiff_deflate')
+                    if fmt in ('jpg','jpeg'):
+                        ov.export_format = fmt
+                        ov.quality = int(jpeg_q or job.quality)
+                    elif fmt == 'png':
+                        ov.export_format = fmt
+                        ov.png_compress_level = int(png_lvl if png_lvl is not None else getattr(job, 'png_compress_level', 6))
+                        ov.quality = getattr(job, 'quality', 90)
+                    elif fmt == 'webp':
+                        ov.export_format = fmt
+                        ov.quality = int(other_q or job.quality)
+                    elif fmt in ('tif','tiff'):
+                        ov.export_format = fmt
+                        ov.quality = int(other_q or job.quality)
+                    o = ov
+                it.setText(4, self._estimate_output_text(o))
+            except Exception:
+                pass
+
+    def _refresh_estimates_throttled(self) -> None:
+        # 简单节流，避免频繁刷新引起卡顿
+        try:
+            from PySide6.QtCore import QTimer
+            if getattr(self, '_est_timer', None) is None:
+                self._est_timer = QTimer(self)
+                self._est_timer.setSingleShot(True)
+                self._est_timer.timeout.connect(self._refresh_estimates)
+            self._est_timer.start(120)
+        except Exception:
+            self._refresh_estimates()
     def _refresh_inspector_preview(self) -> None:
         if not self._selected_indices:
             self.ins_preview.setText("(未选择项目)")
@@ -859,7 +1105,7 @@ class MainWindow(QMainWindow):
 
     def _apply_to_selected(self) -> None:
         if not self._selected_indices:
-            QMessageBox.information(self, "提示", "请先选中文件")
+            self._show_info("请先选中文件")
             return
         for idx in self._selected_indices:
             job = self.jobs[idx]
@@ -882,35 +1128,26 @@ class MainWindow(QMainWindow):
                 elif fmt in ('tif','tiff'):
                     job.tiff_compression = self._adv_tiff_compression
             job.dpi = (self._adv_dpi_x, self._adv_dpi_y)
-            # 最长边优先：若设置了最长边且宽高均留空，则用(最长边, 0)
-            wv, hv, lv = self.ins_width.value(), self.ins_height.value(), self.ins_longest.value()
-            if lv > 0 and wv == 0 and hv == 0:
-                job.req_size = (lv, 0)
-            else:
-                job.req_size = (wv, hv)
+            wv, hv = self.ins_width.value(), self.ins_height.value()
+            job.req_size = (wv, hv)
             job.keep_aspect = bool(self.btn_lock.isChecked())
             job.template = self.ins_template.text()
-        QMessageBox.information(self, "提示", "已应用到选中项")
+        self._show_info("已应用到选中项")
+        self._refresh_estimates_throttled()
 
     def _on_format_changed(self, fmt: str) -> None:
         f = (fmt or "").lower()
         # 切换堆叠页
         if f in ("jpg", "jpeg"):
             self.ins_param_stack.setCurrentIndex(0)
-            if hasattr(self, '_param_title'):
-                self._param_title.setText('质量')
         elif f == "png":
             self.ins_param_stack.setCurrentIndex(1)
-            if hasattr(self, '_param_title'):
-                self._param_title.setText('压缩等级')
         elif f in ("tif","tiff"):
             self.ins_param_stack.setCurrentIndex(2)
-            if hasattr(self, '_param_title'):
-                self._param_title.setText('压缩方式')
         else:
             self.ins_param_stack.setCurrentIndex(3)
-            if hasattr(self, '_param_title'):
-                self._param_title.setText('质量')
+        if hasattr(self, '_param_title'):
+            self._param_title.setText('参数')
 
     # ---------- 任务回调、状态更新 ----------
     def _on_job_update(self, job_index: int, job: JobItem) -> None:
@@ -919,9 +1156,15 @@ class MainWindow(QMainWindow):
         if not it:
             return
         it.setText(2, job.size_text())
+        # 大小与预估更新
+        try:
+            it.setText(3, self._human_bytes(job.src_bytes))
+            it.setText(4, self._estimate_output_text(job))
+        except Exception:
+            pass
         # 状态着色徽标化
         txt = job.status_text()
-        it.setText(3, txt)
+        it.setText(5, txt)
         from PySide6.QtGui import QBrush, QColor
         color_map = {
             JobStatus.WAITING: QColor('#6B7280'),
@@ -931,9 +1174,9 @@ class MainWindow(QMainWindow):
             JobStatus.FAILED: QColor('#DC2626'),
             JobStatus.CANCELLED: QColor('#9CA3AF'),
         }
-        it.setForeground(3, QBrush(color_map.get(job.status, QColor('#374151'))))
-        it.setText(4, f"{job.progress}%")
-        it.setText(5, job.error or "")
+        it.setForeground(5, QBrush(color_map.get(job.status, QColor('#374151'))))
+        it.setText(6, f"{job.progress}%")
+        it.setText(7, job.error or "")
         # 出错弹出通知（后台可见）
         if job.status == JobStatus.FAILED and job.error:
             base = os.path.basename(job.src_path)
@@ -962,6 +1205,8 @@ class MainWindow(QMainWindow):
             self._label_remaining.setText("剩余：0")
             if hasattr(self, '_label_done'):
                 self._label_done.setText("已完成 0/0")
+            # 空列表时显示提示
+            self._update_empty_placeholder()
             return
         done = sum(1 for j in self.jobs if j.status in (JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED))
         self.total_progress.setValue(int(100 * done / total))
@@ -991,7 +1236,7 @@ class MainWindow(QMainWindow):
         """
         # 启动前先校验输出目录是否存在
         if not os.path.isdir(self.output_dir):
-            QMessageBox.warning(self, "输出目录", "当前输出目录不存在，请选择新的输出目录。")
+            self._show_warning("当前输出目录不存在，请选择新的输出目录。","输出目录")
             newd = QFileDialog.getExistingDirectory(self, "选择输出目录", os.getcwd())
             if not newd:
                 return False
@@ -1093,12 +1338,10 @@ class MainWindow(QMainWindow):
                 elif fmt in ('tif','tiff'):
                     job.tiff_compression = self._adv_tiff_compression
             # 尺寸与比例
-            wv, hv, lv = self.ins_width.value(), self.ins_height.value(), self.ins_longest.value()
-            if lv > 0 and wv == 0 and hv == 0:
-                job.req_size = (lv, 0)
-            else:
-                job.req_size = (wv, hv)
+            wv, hv = self.ins_width.value(), self.ins_height.value()
+            job.req_size = (wv, hv)
             job.keep_aspect = bool(self.btn_lock.isChecked())
+        self._refresh_estimates_throttled()
 
     # ---------- 托盘与后台 ----------
     def _init_tray(self) -> None:
@@ -1207,11 +1450,17 @@ class MainWindow(QMainWindow):
         """打开应用设置对话框。"""
         dlg = AppSettingsDialog(self.settings, self)
         if dlg.exec() == QDialog.Accepted:
-            enable, action, dup = dlg.values()
+            enable, action, dup, cols = dlg.values()
             self.settings.enable_notifications = enable
             self.settings.on_close_action = action
             self.settings.collision_policy = dup
+            # 列显示设置
+            self.settings.show_col_dims = bool(cols.get('show_col_dims', True))
+            self.settings.show_col_size = bool(cols.get('show_col_size', True))
+            self.settings.show_col_estimate = bool(cols.get('show_col_estimate', True))
             AppSettings.save(self.settings)
+            self._apply_column_visibility()
+            self._refresh_estimates_throttled()
 
     def _open_format_settings_dialog(self) -> None:
         """打开‘更多设置’对话框，依当前格式显示高级参数。"""
@@ -1221,11 +1470,16 @@ class MainWindow(QMainWindow):
             dlg.apply_to_main()
 
     def _update_thread_controls(self) -> None:
-        """根据模式启用/禁用线程数控件并显示解析结果。"""
-        auto = self.ins_threads_mode.currentText() == 'Auto'
-        self.ins_threads.setEnabled(not auto)
-        self.lbl_threads_res.setVisible(True)
-        self.lbl_threads_res.setText(f'= {self._auto_threads} 线程')
+        """根据Auto/手动选择启用/禁用线程数控件。"""
+        auto = hasattr(self, 'rb_auto') and self.rb_auto.isChecked()
+        en = not auto
+        self.ins_threads.setEnabled(en)
+        if hasattr(self, 'btn_thr_minus'):
+            self.btn_thr_minus.setEnabled(en)
+        if hasattr(self, 'btn_thr_plus'):
+            self.btn_thr_plus.setEnabled(en)
+        if hasattr(self, 'rb_auto'):
+            self.rb_auto.setText(f"Auto（当前={self._auto_threads} 线程）")
 
     def _ensure_valid_output_dir(self) -> None:
         """保留占位以兼容旧调用（已不在启动时强制创建）。"""
@@ -1235,7 +1489,7 @@ class MainWindow(QMainWindow):
         """返回用于文件/文件夹选择对话框的起始目录，若上次目录不存在则提示并让用户选择。"""
         d = self.settings.last_input_dir or os.getcwd()
         if not os.path.isdir(d):
-            QMessageBox.information(self, "输入目录", "之前的输入目录不存在，请选择新的输入目录。")
+            self._show_info("之前的输入目录不存在，请选择新的输入目录。","输入目录")
             nd = QFileDialog.getExistingDirectory(self, "选择输入目录", os.getcwd())
             if nd:
                 self.settings.last_input_dir = nd
