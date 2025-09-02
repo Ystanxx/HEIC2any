@@ -10,6 +10,7 @@ import os
 import subprocess
 from dataclasses import dataclass
 from typing import List, Tuple
+import sys
 
 
 @dataclass
@@ -69,3 +70,34 @@ def test_env_dependencies(env: CondaEnv) -> Tuple[bool, str]:
         return True, "依赖就绪"
     return False, err or out or "依赖不满足"
 
+
+def find_system_pythons() -> List[str]:
+    """发现系统中的 Python 解释器路径列表。
+
+    - 永远包含当前进程的 `sys.executable`
+    - Windows 上尝试通过 `py -0p` 枚举已注册的解释器
+    - 其他平台可扩展 PATH 搜索，这里保守返回当前解释器
+    """
+    paths: List[str] = []
+    try:
+        paths.append(sys.executable)
+    except Exception:
+        pass
+    # Windows 的 py 启动器
+    if os.name == 'nt':
+        try:
+            code, out, err = _run(['py', '-0p'])
+            if code == 0:
+                for line in out.splitlines():
+                    p = line.strip()
+                    if p and os.path.isfile(p) and p.lower().endswith('python.exe'):
+                        if p not in paths:
+                            paths.append(p)
+        except Exception:
+            pass
+    # 去重
+    uniq = []
+    for p in paths:
+        if p and p not in uniq:
+            uniq.append(p)
+    return uniq

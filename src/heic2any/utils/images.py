@@ -17,8 +17,11 @@ def make_placeholder_thumbnail() -> QPixmap:
     return pix
 
 
-def load_thumbnail(path: str) -> Optional[QImage]:
+def load_thumbnail(path: str, max_side: int = 256) -> Optional[QImage]:
     """尝试加载真实缩略图为QImage；失败则返回None。
+
+    参数:
+        max_side: 最大边尺寸，默认256。会使用高质量下采样（LANCZOS）。
 
     说明：QImage可安全跨线程传递，QPixmap需在GUI线程创建。
     """
@@ -30,7 +33,9 @@ def load_thumbnail(path: str) -> Optional[QImage]:
         except Exception:
             return None
         with Image.open(path) as im:
-            im.thumbnail((48, 48))
+            # 限制到 max_side，并使用高质量采样
+            max_side = max(64, min(1024, int(max_side)))
+            im.thumbnail((max_side, max_side), Image.LANCZOS)
             img = im.convert('RGB')
             # 注意：QImage使用外部缓冲区时需拷贝，避免悬空指针
             data = img.tobytes('raw', 'RGB')
